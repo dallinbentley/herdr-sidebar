@@ -49,6 +49,12 @@ fn main() -> std::io::Result<()> {
             println!("{}", launch::focused_pane_in(&read_stdin()?, &scope));
             return Ok(());
         }
+        Some("--pane-has-token") => {
+            let pane_id = std::env::args().nth(2).unwrap_or_default();
+            let present = launch::pane_has_token(&read_stdin()?, &pane_id);
+            println!("{}", if present { "yes" } else { "no" });
+            return Ok(());
+        }
         Some("--event-scope") => {
             let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
             println!("{}", launch::event_scope(&payload));
@@ -98,7 +104,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab|--auto-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--dock-right]"
             );
             std::process::exit(2);
         }
