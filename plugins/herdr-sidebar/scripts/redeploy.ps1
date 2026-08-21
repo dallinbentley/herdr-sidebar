@@ -3,8 +3,8 @@
 # Windows locks a running exe, so a successful `cargo build --release` implies
 # the old TUI processes are already dead -- but their PANES linger, and a
 # lingering Explorer/Sidebar pane blocks the ensure hook from re-docking a
-# fresh one. This closes every herdr-aa pane in EVERY workspace and kills any
-# straggler processes; the tab/workspace-focus hooks then re-dock fresh panes
+# fresh one. This closes every sidebar pane in EVERY workspace and reaps only
+# the short-lived ensure sidecar; tab-focus hooks then re-dock fresh panes
 # (running the newest binaries) the moment each workspace is next focused.
 #
 # Invoke after rebuilding either plugin:
@@ -17,7 +17,9 @@ $OutputEncoding = $Utf8NoBom
 
 $HerdrBin = if ($env:HERDR_BIN_PATH) { $env:HERDR_BIN_PATH } else { 'herdr' }
 
-$Labels = @('Explorer', 'Source Control', 'Sidebar', 'Preview')
+# Preview panes may hold an experimental editor buffer. Leave them alive so a
+# routine sidebar redeploy cannot discard unsaved work.
+$Labels = @('Explorer', 'Source Control', 'Sidebar')
 
 $workspaces = (& $HerdrBin workspace list | Out-String | ConvertFrom-Json).result.workspaces
 foreach ($ws in $workspaces) {
@@ -26,7 +28,12 @@ foreach ($ws in $workspaces) {
         $isPlugin = $Labels -contains $pane.label
         if (-not $isPlugin -and $pane.tokens) {
             foreach ($name in $pane.tokens.PSObject.Properties.Name) {
-                if ($name -like 'herdr-aa*') { $isPlugin = $true; break }
+                if ($name -like 'herdr-aa*' -or
+                    $name -eq 'herdr-sidebar-explorer' -or
+                    $name -eq 'herdr-sidebar-git') {
+                    $isPlugin = $true
+                    break
+                }
             }
         }
         if ($isPlugin) {
@@ -36,8 +43,9 @@ foreach ($ws in $workspaces) {
     }
 }
 
-# Stragglers holding old binaries (a closed pane does not always kill its TUI).
-Get-CimInstance Win32_Process -Filter "Name LIKE 'herdr-sidebar%'" | ForEach-Object {
+# The short-lived ensure sidecar is safe to reap. Never kill herdr-sidebar.exe
+# by name here: a surviving Preview pane may hold an unsaved editor buffer.
+Get-CimInstance Win32_Process -Filter "Name = 'herdr-sidebar-ensure.exe'" | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     Write-Output "killed $($_.ProcessId) $($_.Name)"
 }

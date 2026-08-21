@@ -11,6 +11,8 @@ mod explorer_app;
 mod scm_app;
 
 use std::io::Read;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -26,21 +28,43 @@ fn main() -> std::io::Result<()> {
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision (the
             // open-git launcher); default is the explorer/sidebar decision.
+            // Optional THIRD arg scopes the decision to a tab or workspace —
+            // it must match the scope the hook docks into, or the decision
+            // answers for one tab while the dock lands in another.
             let now = state::unix_now();
+            let scope = std::env::args().nth(3).unwrap_or_default();
             let out = if std::env::args().nth(2).as_deref() == Some("git") {
                 launch::launch_decision_git(&read_stdin()?, now)
             } else {
-                launch::launch_decision(&read_stdin()?, now)
+                launch::launch_decision_in(&read_stdin()?, now, &scope)
             };
             println!("{out}");
             return Ok(());
         }
         Some("--focused-pane") => {
-            println!("{}", launch::focused_pane(&read_stdin()?));
+            // Optional scope (tab or workspace id) confines the lookup to the
+            // tab being docked; without it the globally focused pane wins and
+            // a new tab gets rooted in whatever project was last focused.
+            let scope = std::env::args().nth(2).unwrap_or_default();
+            println!("{}", launch::focused_pane_in(&read_stdin()?, &scope));
+            return Ok(());
+        }
+        Some("--event-scope") => {
+            let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+            println!("{}", launch::event_scope(&payload));
             return Ok(());
         }
         Some("--open-plan") => {
-            println!("{}", launch::open_plan(&read_stdin()?));
+            let dock_right = state::load_state().dock_right;
+            println!("{}", launch::open_plan(&read_stdin()?, dock_right));
+            return Ok(());
+        }
+        Some("--event-kind") => {
+            // Which event ran the ensure hook, so it can treat a brand-new
+            // space differently from an ordinary focus. Empty when herdr
+            // supplies no payload (e.g. a manual invocation).
+            let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+            println!("{}", launch::event_kind(&payload));
             return Ok(());
         }
         Some("--focused-tab") => {
@@ -53,9 +77,19 @@ fn main() -> std::io::Result<()> {
             println!("{}", if state::load_state().auto_open { "on" } else { "off" });
             return Ok(());
         }
+        Some("--dock-right") => {
+            println!("{}", if state::load_state().dock_right { "right" } else { "left" });
+            return Ok(());
+        }
         Some("--preview") => {
-            let Some(control) = std::env::args().nth(2) else {
-                eprintln!("herdr-sidebar: --preview needs a control-file path");
+            let Some(control) = std::env::args()
+                .nth(2)
+                .or_else(|| std::env::var(state::PREVIEW_CONTROL_ENV).ok())
+            else {
+                eprintln!(
+                    "herdr-sidebar: --preview needs {}",
+                    state::PREVIEW_CONTROL_ENV
+                );
                 std::process::exit(2);
             };
             return viewer::run(std::path::Path::new(&control));
@@ -64,7 +98,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview <ctl>|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab|--auto-open]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab|--auto-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -106,10 +140,16 @@ fn main() -> std::io::Result<()> {
     // itself (the app loops haven't started yet, and a token-less pane gets
     // REPLACE-killed by the corpse rule while the user reads the prompt).
     herdr_sidebar::fontsetup::maybe_prompt(&mut terminal, view, persisted.merged)?;
+    let cwd_follower = Rc::new(RefCell::new(launch::CwdFollower::default()));
+    let workspace_label = workspace_label();
     let result = loop {
         let exit = match view {
-            View::Explorer => run_explorer(&mut terminal),
-            View::SourceControl => run_scm(&mut terminal),
+            View::Explorer => {
+                run_explorer(&mut terminal, Rc::clone(&cwd_follower), &workspace_label)
+            }
+            View::SourceControl => {
+                run_scm(&mut terminal, Rc::clone(&cwd_follower), &workspace_label)
+            }
         };
         match exit {
             Ok(Exit::Quit) => break Ok(()),
@@ -130,11 +170,44 @@ fn read_stdin() -> std::io::Result<String> {
     Ok(buf)
 }
 
+/// The label of the space this pane lives in, or "" when it can't be
+/// resolved — the caller then falls back to the pane's cwd.
+fn workspace_label() -> String {
+    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else { return String::new() };
+    herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({}))
+        .map(|json| herdr_sidebar::launch::workspace_label(&json, &ws_id))
+        .unwrap_or_default()
+}
+
+/// The directory the tree is built from: the root this space remembers,
+/// else the cwd the pane was spawned with.
+///
+/// The spawn cwd is only a guess — the ensure hook takes it from whichever
+/// pane happened to be focused — so a remembered choice always wins. A
+/// remembered root that has since been deleted is ignored rather than
+/// yielding an empty tree.
+fn resolve_root(workspace_label: &str) -> std::io::Result<std::path::PathBuf> {
+    let root = if let Some(root) = herdr_sidebar::state::load_root(workspace_label)
+        && root.is_dir()
+    {
+        root
+    } else {
+        std::env::current_dir()?
+    };
+    herdr_sidebar::state::save_root(workspace_label, &root);
+    Ok(root)
+}
+
 /// The explorer's event loop: short poll so the liveness heartbeat keeps
 /// stamping even while idle.
-fn run_explorer(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
-    let root = std::env::current_dir()?;
-    let mut app = explorer_app::App::new(root);
+fn run_explorer(
+    terminal: &mut ratatui::DefaultTerminal,
+    cwd_follower: Rc<RefCell<launch::CwdFollower>>,
+    workspace_label: &str,
+) -> std::io::Result<Exit> {
+    let root = resolve_root(workspace_label)?;
+    let mut remembered_root = root.clone();
+    let mut app = explorer_app::App::new(root, cwd_follower);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         // 500ms: quick enough that a finished folder pick lands promptly,
@@ -148,21 +221,33 @@ fn run_explorer(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit
             if let Some(exit) = exit {
                 return Ok(exit);
             }
-        } else {
-            app.heartbeat();
-            app.poll_picker();
+        }
+        app.heartbeat();
+        app.poll_picker();
+        app.tick();
+        let root = app.root_path();
+        if root != remembered_root {
+            herdr_sidebar::state::save_root(workspace_label, &root);
+            remembered_root = root;
         }
     }
 }
 
 /// The source-control view's event loop: poll + tick so external changes and
 /// finished background work (✧ suggestions, syncs) show up on their own.
-fn run_scm(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
-    let cwd = std::env::current_dir()?;
-    let mut app = scm_app::App::new(cwd);
+fn run_scm(
+    terminal: &mut ratatui::DefaultTerminal,
+    cwd_follower: Rc<RefCell<launch::CwdFollower>>,
+    workspace_label: &str,
+) -> std::io::Result<Exit> {
+    let cwd = resolve_root(workspace_label)?;
+    let mut remembered_root = cwd.clone();
+    let mut app = scm_app::App::new(cwd, cwd_follower);
+    let mut last_tick = std::time::Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(REFRESH_EVERY)? {
+        let timeout = REFRESH_EVERY.saturating_sub(last_tick.elapsed());
+        if event::poll(timeout)? {
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
@@ -171,10 +256,17 @@ fn run_scm(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
             if let Some(exit) = exit {
                 return Ok(exit);
             }
-        } else {
-            app.heartbeat();
-            app.poll_picker();
+        }
+        app.heartbeat();
+        app.poll_picker();
+        if last_tick.elapsed() >= REFRESH_EVERY {
             app.tick();
+            last_tick = std::time::Instant::now();
+        }
+        let root = app.root_path().to_path_buf();
+        if root != remembered_root {
+            herdr_sidebar::state::save_root(workspace_label, &root);
+            remembered_root = root;
         }
     }
 }

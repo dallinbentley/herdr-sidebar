@@ -165,8 +165,7 @@ fn run(
                 // Only an explicit decline answers "no" — a stray arrow key
                 // must not silently commit the user to emoji icons.
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
-                    st.font_prompt_done = true;
-                    state::save_state(*st);
+                    *st = state::update_state(|state| state.font_prompt_done = true);
                     return Ok(());
                 }
                 _ => {}
@@ -176,8 +175,7 @@ fn run(
                 // stays None, so the next start re-probes and still picks
                 // material if the install landed). Never wedge the pane.
                 if key.code == KeyCode::Esc {
-                    st.font_prompt_done = true;
-                    state::save_state(*st);
+                    *st = state::update_state(|state| state.font_prompt_done = true);
                     return Ok(());
                 }
             }
@@ -188,8 +186,7 @@ fn run(
                     }
                 }
                 _ => {
-                    st.font_prompt_done = true;
-                    state::save_state(*st);
+                    *st = state::update_state(|state| state.font_prompt_done = true);
                     return Ok(());
                 }
             },

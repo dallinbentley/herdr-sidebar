@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # ensure-explorer.sh — unix [[events]] hook body: make sure the FOCUSED tab has
-# an Explorer pane docked on the left, WITHOUT stealing the user's focus.
+# an Explorer pane docked on the configured edge, WITHOUT stealing focus.
 #
-# Runs on tab.focused / workspace.focused, so it must be idempotent and quiet:
+# Runs on pane/tab lifecycle events, so it must be idempotent and quiet:
 # already present → exit; else open unfocused (see ensure-explorer.ps1 for the
 # focus-follows-the-slot rationale behind the final `pane focus`).
 set -uo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-bin="$script_dir/../target/release/herdr-sidebar"
+bin_dir="$script_dir/../target/release"
+bin="$bin_dir/herdr-sidebar"
 [ -x "$bin" ] || exit 0
 
 # "Auto-open sidebar: off" (⚙ Settings): hooks leave closed tabs alone; only
@@ -35,39 +36,77 @@ trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
 panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 [ -n "$panes" ] || exit 0
 
-decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || true)"
-[ "$decision" = "OPEN" ] || exit 0
+# The tab THIS event is about. The globally focused pane is still the space
+# you came from during a workspace switch, which rooted new sidebars in the
+# wrong project. Everything below reasons about this one scope — decision,
+# snooze check, and spawn cwd must agree or we dock into the wrong tab.
+scope="$("$bin" --event-scope 2>/dev/null || true)"
+
+decision="$(printf '%s' "$panes" | "$bin" --launch-decision "" "$scope" 2>/dev/null || true)"
+replacing="false"
+case "$decision" in
+  "OPEN") ;;
+  "REPLACE "*)
+    # A label-only or stale pane is a corpse, not a reason to suppress the
+    # hook. Close it and refresh: focus/layout can change with the close.
+    pid="${decision#REPLACE }"
+    "$herdr_bin" pane close "$pid" >/dev/null 2>&1 || true
+    panes="$("$herdr_bin" pane list 2>/dev/null || true)"
+    [ -n "$panes" ] || exit 0
+    replacing="true"
+    ;;
+  *) exit 0 ;;
+esac
 
 # Respect a tab the user toggled closed (open-explorer.sh writes the marker) —
 # otherwise the very next focus event would reopen what they just closed.
 snooze_dir="${TMPDIR:-/tmp}/herdr-sidebar-snooze"
-tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
-[ -n "$tab" ] && [ -f "$snooze_dir/${tab//:/_}" ] && exit 0
+# A scope containing ':' IS a tab id (w4:tY). An empty scope falls back to the
+# focused tab for legacy events; a workspace scope has no tab snooze to borrow.
+case "$scope" in
+  *:*) tab="$scope" ;;
+  "")  tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)" ;;
+  *)   tab="" ;;
+esac
+if [ "$replacing" != "true" ] && [ -n "$tab" ] && [ -f "$snooze_dir/${tab//:/_}" ]; then
+  exit 0
+fi
 
-fp="$(printf '%s' "$panes" | "$bin" --focused-pane 2>/dev/null || true)"
+fp="$(printf '%s' "$panes" | "$bin" --focused-pane "$scope" 2>/dev/null || true)"
 fid="${fp%%	*}"
 fcwd="${fp#*	}"
 [ -n "$fid" ] || exit 0
 
 target="$fid"
-ratio="0.25"
+if [ "$("$bin" --dock-right 2>/dev/null || echo left)" = "right" ]; then
+  ratio="0.75"
+  needs_swap="false"
+else
+  ratio="0.25"
+  needs_swap="true"
+fi
 plan="$("$herdr_bin" pane layout --pane "$fid" 2>/dev/null | "$bin" --open-plan 2>/dev/null || true)"
 if [ -n "$plan" ]; then
-  target="${plan%%	*}"
-  ratio="${plan#*	}"
+  IFS=$'\t' read -r target ratio needs_swap <<< "$plan"
 fi
 
-out="$("$herdr_bin" pane split "$target" --direction right --ratio "$ratio" \
-  ${fcwd:+--cwd "$fcwd"} --no-focus 2>/dev/null || true)"
+split_args=(pane split "$target" --direction right --ratio "$ratio" --no-focus \
+  --env "PATH=$bin_dir${PATH:+:$PATH}")
+[ -n "$fcwd" ] && split_args+=(--cwd "$fcwd")
+[ -n "${HERDR_PLUGIN_STATE_DIR:-}" ] && \
+  split_args+=(--env "HERDR_PLUGIN_STATE_DIR=$HERDR_PLUGIN_STATE_DIR")
+out="$("$herdr_bin" "${split_args[@]}" 2>/dev/null || true)"
 np="$(printf '%s' "$out" | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -n1)"
 [ -n "$np" ] || exit 0
 
-"$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
-"$herdr_bin" pane run "$np" "exec \"$bin\""
+if [ "$needs_swap" = "true" ]; then
+  "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
+fi
+"$herdr_bin" pane run "$np" "herdr-sidebar"
 "$herdr_bin" pane rename "$np" Explorer >/dev/null 2>&1 || true
 
 # Hand focus back if the swap left it on the explorer (focus follows the slot).
-if [ "$target" = "$fid" ]; then
+if [ "$needs_swap" = "true" ] && [ "$target" = "$fid" ]; then
   "$herdr_bin" pane focus --direction right --pane "$np" >/dev/null 2>&1 || true
 fi
 exit 0

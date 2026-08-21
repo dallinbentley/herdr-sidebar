@@ -2,26 +2,25 @@
 # and source control in one plugin (one pane by default, separated panes on
 # request via the ⚙ settings).
 #
-# Cross-platform notes (verified against herdr 0.7.1; see CLAUDE.md for the
+# Cross-platform notes (verified against herdr 0.8; see CLAUDE.md for the
 # full findings list):
 #  - Action ids must be GLOBALLY unique across platforms, so Windows launchers
 #    use `-windows`-suffixed ids; both variants gate with the item-level
 #    `platforms` key.
-#  - herdr can NOT spawn a relative [[panes]] command on Windows — it resolves
-#    the program against herdr's own directory (ERROR_PATH_NOT_FOUND) and
-#    reports the plugin root as a `\\?\` verbatim path. Windows launches go
-#    through wscript → the GUI-subsystem ensure sidecar → the socket API
-#    (any console in a hook chain flashes a Windows Terminal window per focus
-#    event on Windows 11). The [[panes]] entry below serves linux/macos only.
-#  - Launchers dock the sidebar on the LEFT edge of the tab: `pane split` only
-#    goes right/down, so they split the leftmost pane and `pane swap` the new
-#    pane into the left slot.
+#  - Relative action/event commands resolve from the plugin root since herdr
+#    0.8, so Windows invokes the GUI-subsystem ensure sidecar directly. The
+#    sidecar still matters: any console process in a hook chain flashes a
+#    Windows Terminal window per focus event on Windows 11.
+#  - Relative [[panes]] commands still fail on Windows (a separate herdr code
+#    path), so the declarative pane below serves linux/macos only.
+#  - Launchers dock on the persisted left/right edge. A left dock needs a
+#    split+swap; a right dock is already in place after the split.
 
 id = "herdr-sidebar"
 name = "herdr-sidebar"
-version = "0.7.0"
+version = "0.8.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
-min_herdr_version = "0.7.0"
+min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
 
 [[build]]
@@ -36,20 +35,20 @@ title = "Sidebar"
 placement = "split"
 command = ["./target/release/herdr-sidebar"]
 
-# Toggle the sidebar: open left-docked / focus if unfocused / close if focused.
+# Toggle the sidebar: open at the configured dock edge / focus / close.
 [[actions]]
 id = "open-sidebar"
 platforms = ["linux", "macos"]
 title = "Toggle sidebar"
-description = "Open the sidebar docked on the left (focus it if open; close it if focused)."
+description = "Open the sidebar at its configured dock edge (focus it if open; close it if focused)."
 command = ["bash", "scripts/open-sidebar.sh"]
 
 [[actions]]
 id = "open-sidebar-windows"
 platforms = ["windows"]
 title = "Toggle sidebar"
-description = "Open the sidebar docked on the left (focus it if open; close it if focused)."
-command = ["wscript", "//B", "scripts/launch-ensure.vbs", "--toggle"]
+description = "Open the sidebar at its configured dock edge (focus it if open; close it if focused)."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--toggle"]
 
 # Separated-panels mode: open the Source Control pane on its own (the ⚙
 # settings' "Unified sidebar: off"). The explorer side is what the sidebar
@@ -86,13 +85,13 @@ title = "Redeploy sidebar panes"
 description = "Close all sidebar panes in every workspace so they respawn on the latest build."
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/redeploy.ps1"]
 
-# Sidebar mode: on every tab/workspace focus, quietly ensure the focused tab
-# has a left-docked sidebar (idempotent, never steals focus). A tab hooked at
+# Sidebar mode: on every tab focus, quietly ensure the focused tab
+# has a sidebar at the configured dock edge (idempotent, never steals focus). A tab hooked at
 # first focus still has its single full-height pane, so the sidebar becomes a
-# full-height left column that later splits can't shorten.
+# full-height edge column that later splits can't shorten.
 # tab.created / workspace.created fire when a restarted server RESTORES its
 # session — the resumed tab is already focused, so no focus TRANSITION (and
-# no tab.focused/workspace.focused) ever happens, which used to leave dead
+# no tab.focused) ever happens, which used to leave dead
 # resumed sidebars (label + scrollback survive a restart; the process and
 # metadata tokens do not) sitting unhealed until the user switched tabs.
 # pane.focused heals resumed corpses the moment the user interacts with the
@@ -108,7 +107,7 @@ command = ["bash", "scripts/ensure-sidebar.sh"]
 [[events]]
 on = "pane.focused"
 platforms = ["windows"]
-command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 
 [[events]]
 on = "tab.created"
@@ -118,7 +117,7 @@ command = ["bash", "scripts/ensure-sidebar.sh"]
 [[events]]
 on = "tab.created"
 platforms = ["windows"]
-command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 
 [[events]]
 on = "workspace.created"
@@ -128,7 +127,7 @@ command = ["bash", "scripts/ensure-sidebar.sh"]
 [[events]]
 on = "workspace.created"
 platforms = ["windows"]
-command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 
 [[events]]
 on = "tab.focused"
@@ -136,16 +135,6 @@ platforms = ["linux", "macos"]
 command = ["bash", "scripts/ensure-sidebar.sh"]
 
 [[events]]
-on = "workspace.focused"
-platforms = ["linux", "macos"]
-command = ["bash", "scripts/ensure-sidebar.sh"]
-
-[[events]]
 on = "tab.focused"
 platforms = ["windows"]
-command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
-
-[[events]]
-on = "workspace.focused"
-platforms = ["windows"]
-command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]

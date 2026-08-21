@@ -13,6 +13,8 @@ pub enum MenuAction {
     CopyRelativePath,
     Rename,
     Delete,
+    /// `git add` the target — the Explorer's staging entry (issue #20).
+    Stage,
     OpenExternal,
     Reveal,
     ChangeFolder,
@@ -29,8 +31,11 @@ pub enum MenuEntry {
 /// row; `None` for a right-click on empty space, which targets the workspace
 /// root: creation only). "Open with Default App" is offered for files only —
 /// a directory's shell association is the file manager, which is what
-/// "Reveal in File Explorer" already does.
-pub fn menu_entries(target: Option<bool>) -> Vec<MenuEntry> {
+/// "Reveal in File Explorer" already does. `in_repo` adds "Stage Changes"
+/// (issue #20) — it stays out of the menu entirely when the target is not
+/// inside a git repository, so the entry never offers an action that can only
+/// fail.
+pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
     let mut entries = vec![
         MenuEntry::Action(MenuAction::NewFile, "New File…"),
         MenuEntry::Action(MenuAction::NewFolder, "New Folder…"),
@@ -39,6 +44,12 @@ pub fn menu_entries(target: Option<bool>) -> Vec<MenuEntry> {
         entries.extend([
             MenuEntry::Separator,
             MenuEntry::Action(MenuAction::OpenExternal, "Open with Default App"),
+        ]);
+    }
+    if target.is_some() && in_repo {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::Action(MenuAction::Stage, "Stage Changes"),
         ]);
     }
     if target.is_some() {
@@ -143,6 +154,45 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     Err(last_err)
 }
 
+/// Read text from the system clipboard when a platform clipboard command is
+/// available. Keeping this best-effort matches [`copy_to_clipboard`]: the
+/// editor remains useful over SSH/headless sessions where no clipboard exists.
+pub fn paste_from_clipboard() -> io::Result<String> {
+    #[cfg(windows)]
+    let candidates: &[&[&str]] = &[&[
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); Get-Clipboard -Raw",
+    ]];
+    #[cfg(target_os = "macos")]
+    let candidates: &[&[&str]] = &[&["pbpaste"]];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[&[&str]] = &[
+        &["wl-paste", "--no-newline"],
+        &["xclip", "-selection", "clipboard", "-o"],
+    ];
+
+    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
+    for argv in candidates {
+        match std::process::Command::new(argv[0]).args(&argv[1..]).output() {
+            Ok(output) if output.status.success() => {
+                return String::from_utf8(output.stdout)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+            Ok(output) => {
+                last_err = io::Error::other(format!(
+                    "{} exited with {}",
+                    argv[0], output.status
+                ));
+            }
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
+}
+
 /// Open the platform file manager with the path selected (best-effort).
 pub fn reveal(path: &Path) {
     #[cfg(windows)]
@@ -189,6 +239,66 @@ pub fn open_external(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
+/// Quote text embedded in a double-quoted AppleScript string literal.
+#[cfg(any(test, target_os = "macos"))]
+fn applescript_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Parse a completed osascript picker invocation. Keeping this separate from
+/// process launch makes cancel/error and path normalization testable on every
+/// platform, including CI hosts that do not provide osascript.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_osascript_folder(success: bool, stdout: &[u8]) -> Option<PathBuf> {
+    if !success {
+        return None;
+    }
+    let picked = String::from_utf8_lossy(stdout).trim().to_string();
+    if picked.is_empty() {
+        return None;
+    }
+    let trimmed = picked.trim_end_matches('/');
+    Some(if trimmed.is_empty() { PathBuf::from("/") } else { PathBuf::from(trimmed) })
+}
+
+/// Native "choose a folder" dialog. The apps call this from a worker thread
+/// so their heartbeat continues while the dialog is open.
+///
+/// macOS deliberately uses an osascript subprocess: rfd's Cocoa backend needs
+/// the main thread or a running NSApplication and aborts a terminal TUI when
+/// invoked from the worker. Windows keeps its existing rfd/IFileDialog path.
+#[cfg(any(windows, target_os = "macos"))]
+pub fn pick_folder(start: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // An invalid default location makes choose-folder fail instead of
+        // opening, so omit it if the former root has disappeared.
+        let location = if start.is_dir() {
+            format!(
+                " default location POSIX file \"{}\"",
+                applescript_escape(&start.display().to_string())
+            )
+        } else {
+            String::new()
+        };
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "POSIX path of (choose folder with prompt \"Open Folder\"{location})"
+            ))
+            .output()
+            .ok()?;
+        parse_osascript_folder(output.status.success(), &output.stdout)
+    }
+    #[cfg(windows)]
+    {
+        rfd::FileDialog::new()
+            .set_title("Open Folder")
+            .set_directory(start)
+            .pick_folder()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,21 +316,30 @@ mod tests {
 
     #[test]
     fn menu_shape_for_rows_and_root() {
-        let row = menu_entries(Some(false));
+        let row = menu_entries(Some(false), true);
         assert!(matches!(row[0], MenuEntry::Action(MenuAction::NewFile, _)));
         assert!(has(&row, MenuAction::Delete));
-        let root = menu_entries(None);
+        let root = menu_entries(None, true);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
     }
 
     #[test]
     fn open_external_is_offered_for_files_only() {
-        assert!(has(&menu_entries(Some(false)), MenuAction::OpenExternal), "file row");
-        assert!(!has(&menu_entries(Some(true)), MenuAction::OpenExternal), "directory row");
-        assert!(!has(&menu_entries(None), MenuAction::OpenExternal), "empty space");
+        assert!(has(&menu_entries(Some(false), true), MenuAction::OpenExternal), "file row");
+        assert!(!has(&menu_entries(Some(true), true), MenuAction::OpenExternal), "directory row");
+        assert!(!has(&menu_entries(None, true), MenuAction::OpenExternal), "empty space");
         // Directories keep everything else they had.
-        assert!(has(&menu_entries(Some(true)), MenuAction::Rename));
+        assert!(has(&menu_entries(Some(true), true), MenuAction::Rename));
+    }
+
+    #[test]
+    fn stage_is_offered_for_rows_inside_a_repo_only() {
+        assert!(has(&menu_entries(Some(false), true), MenuAction::Stage), "file row");
+        assert!(has(&menu_entries(Some(true), true), MenuAction::Stage), "directory row");
+        assert!(!has(&menu_entries(None, true), MenuAction::Stage), "empty space");
+        assert!(!has(&menu_entries(Some(false), false), MenuAction::Stage), "outside a repo");
+        assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
     }
 
     #[test]
@@ -232,6 +351,25 @@ mod tests {
         assert_eq!(validate_name("a\\b"), None);
         assert_eq!(validate_name("C:"), None);
         assert_eq!(validate_name(".."), None);
+    }
+
+    #[test]
+    fn applescript_literals_escape_backslashes_before_quotes() {
+        assert_eq!(applescript_escape("/tmp/plain"), "/tmp/plain");
+        assert_eq!(applescript_escape(r#"/tmp/a"b"#), r#"/tmp/a\"b"#);
+        assert_eq!(applescript_escape(r"/tmp/a\b"), r"/tmp/a\\b");
+        assert_eq!(applescript_escape(r#"/tmp/a\"b"#), r#"/tmp/a\\\"b"#);
+    }
+
+    #[test]
+    fn osascript_picker_output_parsing_handles_cancel_root_and_trailing_slash() {
+        assert_eq!(parse_osascript_folder(false, b"/ignored/\n"), None);
+        assert_eq!(parse_osascript_folder(true, b"\n"), None);
+        assert_eq!(parse_osascript_folder(true, b"/\n"), Some(PathBuf::from("/")));
+        assert_eq!(
+            parse_osascript_folder(true, b"/Users/alex/My Folder/\n"),
+            Some(PathBuf::from("/Users/alex/My Folder"))
+        );
     }
 
     #[test]
