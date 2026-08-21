@@ -1017,6 +1017,19 @@ mod tests {
     }
 
     #[test]
+    fn pane_token_probe_distinguishes_starting_and_live_sidebars() {
+        let starting = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","tokens":{}}"#,
+        );
+        let live = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","tokens":{"herdr-sidebar-explorer":"100"}}"#,
+        );
+        assert!(!pane_has_token(&starting, "w1:p1"));
+        assert!(pane_has_token(&live, "w1:p1"));
+        assert!(!pane_has_token(&live, "w1:p2"));
+    }
+
+    #[test]
     fn decision_replaces_dead_panes() {
         // Stale heartbeat (or a pre-heartbeat token shape) = a dead TUI whose
         // pane must be closed and re-docked, never focused.

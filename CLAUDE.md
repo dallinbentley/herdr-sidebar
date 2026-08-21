@@ -872,6 +872,11 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
   They now take the SAME `herdr-sidebar-ensure.lock` mkdir lock as the hook — waiting
   (20×0.5s) instead of yielding so the toggle isn't dropped. Post-lock terminal commands
   must NOT `exec`: exec skips the EXIT trap and leaks the lock until the 30s stale-break.
+- **Unix ensure must hold its lock through the first TUI token stamp**: left-docking calls
+  `pane swap` and restores focus, and both operations re-emit focus events. Releasing the
+  lock immediately after `pane run` exposes a label-only pane that the corpse rule replaces,
+  creating an unbounded close/spawn loop (issue #29). Poll the new pane's identity token while
+  locked, matching the Windows ensure; do not replace this with a fixed startup sleep.
 - The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
   installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
   their persisted value).

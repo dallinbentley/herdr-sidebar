@@ -105,6 +105,18 @@ fi
 "$herdr_bin" pane run "$np" "herdr-sidebar"
 "$herdr_bin" pane rename "$np" Explorer >/dev/null 2>&1 || true
 
+# Keep the ensure lock through the TUI's first identity stamp. The swap and
+# focus calls above/below emit fresh focus events; without this wait, one can
+# see the new label before its token, classify the pane as a resumed corpse,
+# and replace it forever (issue #29). Six seconds matches the Windows ensure.
+for _ in {1..30}; do
+  current_panes="$("$herdr_bin" pane list 2>/dev/null || true)"
+  if [ "$(printf '%s' "$current_panes" | "$bin" --pane-has-token "$np" 2>/dev/null || true)" = "yes" ]; then
+    break
+  fi
+  sleep 0.2
+done
+
 # Hand focus back if the swap left it on the explorer (focus follows the slot).
 if [ "$needs_swap" = "true" ] && [ "$target" = "$fid" ]; then
   "$herdr_bin" pane focus --direction right --pane "$np" >/dev/null 2>&1 || true
