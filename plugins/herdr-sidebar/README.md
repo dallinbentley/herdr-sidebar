@@ -3,12 +3,14 @@
 **The sidebar your terminal was missing** — a VS Code-inspired file explorer + source
 control panel in one dockable herdr pane.
 
-<img src="docs/media/hero.png" alt="The sidebar: explorer view with a live file preview beside it" width="860">
+<img src="docs/media/hero.png" alt="The sidebar Explorer and live preview interface" width="860">
 
 **The full tour lives in the [repo README](../../README.md)** — features, screenshots,
 keys, and settings.
 
 ## Install
+
+Requires herdr 0.8 or newer.
 
 ```
 herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar

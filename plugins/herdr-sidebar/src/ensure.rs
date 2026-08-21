@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use crate::{ipc, launch};
 
-/// Serialize concurrent runs (focus events arrive in bursts — tab.focused +
-/// workspace.focused per switch; unguarded, one switch opened four panes).
+/// Serialize concurrent runs (pane/tab events arrive in bursts; unguarded,
+/// one switch opened four panes).
 /// Losing the race skips this run; the next event re-fires it.
 struct Lock(PathBuf);
 
@@ -53,12 +53,22 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let Some(_lock) = Lock::acquire() else {
         return Ok(());
     };
-    let panes = ipc::call_text("pane.list", serde_json::json!({}))?;
-    let tab = launch::focused_tab(&panes);
+    let mut panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    // The tab THIS event is about. During a workspace switch the globally
+    // focused pane is still the space you came from, which docked sidebars
+    // into the wrong project (the unix hook script scopes the same way, via
+    // `--event-scope`). A toggle is a deliberate act on the focused tab, so
+    // it stays unscoped.
+    let scope = if toggle {
+        String::new()
+    } else {
+        launch::event_scope(&std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default())
+    };
+    let tab = snooze_tab_for_scope(&panes, &scope);
     let snooze_dir = snooze::dir();
     snooze::sweep(&snooze_dir, &launch::live_tabs(&panes));
     let now = crate::state::unix_now();
-    match launch::launch_decision(&panes, now).split_once(' ') {
+    match launch::launch_decision_in(&panes, now, &scope).split_once(' ') {
         Some(("FOCUS", id)) => {
             if toggle {
                 focus(id)?;
@@ -74,18 +84,32 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
             // A dead pane (stale heartbeat): close it and dock a fresh one,
             // quiet or toggle alike — a corpse should never block the dock.
             ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
-            open(&panes, toggle)?;
+            // Closing a focused corpse changes focus and invalidates its pane
+            // id. Re-plan from a fresh snapshot rather than splitting a pane
+            // that no longer exists.
+            panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+            open(&panes, toggle, &scope)?;
         }
         _ => {
             if toggle {
                 snooze::clear(&snooze_dir, &tab);
-                open(&panes, true)?;
+                open(&panes, true, &scope)?;
             } else if !snooze::is_set(&snooze_dir, &tab) {
-                open(&panes, false)?;
+                open(&panes, false, &scope)?;
             }
         }
     }
     Ok(())
+}
+
+fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {
+    if scope.contains(':') {
+        scope.to_string()
+    } else if scope.is_empty() {
+        launch::focused_tab(panes_json)
+    } else {
+        String::new()
+    }
 }
 
 fn focus(pane_id: &str) -> std::io::Result<()> {
@@ -94,18 +118,32 @@ fn focus(pane_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
-    let fp = launch::focused_pane(panes_json);
+fn open(panes_json: &str, focus_new: bool, scope: &str) -> std::io::Result<()> {
+    // Root the new sidebar from a pane in the scope we are docking into —
+    // the decision above answered for that scope, and the two must agree or
+    // we dock into one tab with another tab's cwd.
+    let fp = launch::focused_pane_in(panes_json, scope);
     let Some((fid, fcwd)) = fp.split_once('\t') else {
         return Ok(());
     };
 
+    let dock_right = crate::state::load_state().dock_right;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": fid }))?;
-    let plan = launch::open_plan(&layout);
-    let (target, ratio) = plan
-        .split_once('\t')
-        .map(|(t, r)| (t.to_string(), r.parse::<f64>().unwrap_or(0.25)))
-        .unwrap_or_else(|| (fid.to_string(), 0.25));
+    let plan = launch::open_plan(&layout, dock_right);
+    let mut fields = plan.split('\t');
+    let target = fields
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fid)
+        .to_string();
+    let ratio = fields
+        .next()
+        .and_then(|r| r.parse::<f64>().ok())
+        .unwrap_or(if dock_right { 0.75 } else { 0.25 });
+    let needs_swap = fields
+        .next()
+        .and_then(|s| s.parse::<bool>().ok())
+        .unwrap_or(!dock_right);
 
     let mut split = serde_json::json!({
         "target_pane_id": target,
@@ -122,21 +160,25 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
         return Ok(());
     };
 
-    ipc::call_text(
-        "pane.swap",
-        serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
-    )?;
-    if let Some(command) = explorer_command() {
+    if needs_swap {
         ipc::call_text(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
+            "pane.swap",
+            serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
         )?;
     }
+    ipc::call_text(
+        "pane.send_input",
+        serde_json::json!({
+            "pane_id": new_pane,
+            "text": crate::state::EXECUTABLE_NAME,
+            "keys": ["Enter"]
+        }),
+    )?;
     ipc::call_text(
         "pane.rename",
         serde_json::json!({ "pane_id": new_pane, "label": launch::PANE_LABEL }),
     )?;
-    full_height_repair(&new_pane);
+    full_height_repair(&new_pane, dock_right);
 
     // Hold the lock until the TUI stamps its identity token (~1-2s): hook
     // invocations queued behind us must observe a LIVE pane, or the
@@ -161,20 +203,19 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Grow the freshly-opened explorer into a full-height left column. When the
-/// tab's left area was already split vertically, the explorer only gets the
+/// Grow the freshly-opened explorer into a full-height edge column. When the
+/// tab's chosen edge was already split vertically, the explorer only gets the
 /// top slot; each repair step re-parents the pane below it as a down-split of
 /// the pane beside it. herdr no-ops same-tab moves, so each step bounces the
 /// pane through a temporary tab (herdr auto-closes it once emptied).
 /// Best-effort: any miss just leaves the layout as it was.
-fn full_height_repair(pane_id: &str) {
+fn full_height_repair(pane_id: &str, dock_right: bool) {
     for _ in 0..4 {
-        let Ok(layout) =
-            ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane_id }))
+        let Ok(layout) = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane_id }))
         else {
             return;
         };
-        let Some(step) = launch::repair_step(&layout, pane_id) else {
+        let Some(step) = launch::repair_step(&layout, pane_id, dock_right) else {
             return;
         };
         let bounced = ipc::call_text(
@@ -195,28 +236,12 @@ fn full_height_repair(pane_id: &str) {
                 "destination": {
                     "type": "tab",
                     "tab_id": step.tab,
-                    "target_pane_id": step.right,
+                    "target_pane_id": step.beside,
                     "split": "down",
                 },
                 "focus": false,
             }),
         );
-    }
-}
-
-/// The shell command that starts the Explorer TUI in the new pane: the sibling
-/// binary next to this sidecar, quoted for the pane's shell.
-fn explorer_command() -> Option<String> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    #[cfg(windows)]
-    {
-        let exe = dir.join("herdr-sidebar.exe");
-        Some(format!("& \"{}\"", exe.display()))
-    }
-    #[cfg(not(windows))]
-    {
-        let exe = dir.join("herdr-sidebar");
-        Some(format!("exec \"{}\"", exe.display()))
     }
 }
 
@@ -244,5 +269,16 @@ mod tests {
         assert!(!snooze::is_set(&dir, "w1:t2"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_events_do_not_borrow_the_globally_focused_tabs_snooze() {
+        let panes = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","focused":true},
+            {"pane_id":"w2:p1","tab_id":"w2:t1"}
+        ]}}"#;
+        assert_eq!(snooze_tab_for_scope(panes, ""), "w1:t1");
+        assert_eq!(snooze_tab_for_scope(panes, "w2:t1"), "w2:t1");
+        assert_eq!(snooze_tab_for_scope(panes, "w2"), "");
     }
 }

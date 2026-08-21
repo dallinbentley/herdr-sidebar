@@ -2,16 +2,13 @@
 # open-git-panel.sh — unix launcher for the herdr-sidebar source control pane.
 #
 # Idempotent "launch-or-focus, toggle on repeat", scoped to the current tab:
-#   - no Source Control pane in the current tab      -> open one, DOCKED ON THE LEFT edge
+#   - no Source Control pane in the current tab      -> open at the configured dock edge
 #   - a Source Control pane exists but isn't focused -> focus it
 #   - the focused pane IS the Source Control pane    -> close it (toggle off)
 #
-# Left dock: herdr's `pane split` only splits right/down, so we split the tab's
-# LEFTMOST pane (the one touching the spaces/agents sidebar) to the right with a
-# small left-slot ratio, then `pane swap` the new pane into that left slot. The
-# split `--ratio` is the ORIGINAL pane's share; after a swap, focus stays with
-# the SLOT, not the pane (both verified against herdr 0.7.1 by herdr-aa-filetree,
-# whose launcher this mirrors).
+# Left docking splits the leftmost pane and swaps into its narrow slot. Right
+# docking splits the rightmost pane with the inverse original-pane ratio and
+# needs no swap. The unit-tested --open-plan output owns that choice.
 #
 # All ids/ratios come from the binary's unit-tested stdin modes
 # (--launch-decision git / --focused-pane / --open-plan), never ad-hoc JSON parsing;
@@ -20,7 +17,8 @@ set -uo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-bin="$script_dir/../target/release/herdr-sidebar"
+bin_dir="$script_dir/../target/release"
+bin="$bin_dir/herdr-sidebar"
 
 # Without the binary there is no decision logic; fall back to herdr's declarative
 # pane open (right split, not left-docked — degraded but functional).
@@ -56,7 +54,7 @@ trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
 panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 
 open_pane() {
-  local fp fid fcwd plan target ratio out np
+  local fp fid fcwd plan target ratio needs_swap out np
   fp="$(printf '%s' "$panes" | "$bin" --focused-pane 2>/dev/null || true)"
   fid="${fp%%	*}"
   fcwd="${fp#*	}"
@@ -66,15 +64,24 @@ open_pane() {
   fi
 
   target="$fid"
-  ratio="0.25"
+  if [ "$("$bin" --dock-right 2>/dev/null || echo left)" = "right" ]; then
+    ratio="0.75"
+    needs_swap="false"
+  else
+    ratio="0.25"
+    needs_swap="true"
+  fi
   plan="$("$herdr_bin" pane layout --pane "$fid" 2>/dev/null | "$bin" --open-plan 2>/dev/null || true)"
   if [ -n "$plan" ]; then
-    target="${plan%%	*}"
-    ratio="${plan#*	}"
+    IFS=$'\t' read -r target ratio needs_swap <<< "$plan"
   fi
 
-  out="$("$herdr_bin" pane split "$target" --direction right --ratio "$ratio" \
-    ${fcwd:+--cwd "$fcwd"} --no-focus 2>/dev/null || true)"
+  split_args=(pane split "$target" --direction right --ratio "$ratio" --no-focus \
+    --env "PATH=$bin_dir${PATH:+:$PATH}")
+  [ -n "$fcwd" ] && split_args+=(--cwd "$fcwd")
+  [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ] && \
+    split_args+=(--env "HERDR_PLUGIN_STATE_DIR=$HERDR_PLUGIN_STATE_DIR")
+  out="$("$herdr_bin" "${split_args[@]}" 2>/dev/null || true)"
   np="$(printf '%s' "$out" | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -n1)"
   [ -n "$np" ] || exit 1
 
@@ -83,8 +90,10 @@ open_pane() {
   # the explorer/last-active decision, so with the unified sidebar off this
   # launcher opened an Explorer pane labeled "Source Control" (issue #14).
   # The Windows launcher (open-git.ps1) always passed the pin.
-  "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
-  "$herdr_bin" pane run "$np" "exec \"$bin\" --view git"
+  if [ "$needs_swap" = "true" ]; then
+    "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
+  fi
+  "$herdr_bin" pane run "$np" "herdr-sidebar --view git"
   "$herdr_bin" pane rename "$np" "Source Control" >/dev/null 2>&1 || true
   # Give the TUI time to stamp its identity token before hooks re-check.
   sleep 3
@@ -112,6 +121,7 @@ case "$decision" in
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
     pid="${decision#REPLACE }"
     "$herdr_bin" pane close "$pid" >/dev/null 2>&1 || true
+    panes="$("$herdr_bin" pane list 2>/dev/null || true)"
     open_pane
     ;;
   *)

@@ -13,8 +13,8 @@ One herdr plugin, a VS Code-style sidebar for the terminal, as a **self-containe
   (in-process, instant); the ⚙ settings can split them into separate Explorer /
   Source Control panes (`--view explorer|git` pins a pane's starting view). `--preview`
   runs the file-preview pane. Views live in `src/explorer_app.rs` / `src/scm_app.rs`
-  (bin modules); shared pieces (icons, ipc, launch parsing, state, ui helpers) are lib
-  modules — nothing is copy-mirrored anymore.
+  (bin modules); shared pieces (icons, ipc, launch parsing, state, ui helpers, git
+  plumbing + `gitdeco` decorations) are lib modules — nothing is copy-mirrored anymore.
 
 There is deliberately **no root cargo workspace**: `herdr plugin install <owner>/<repo>/<subdir>`
 treats the subdirectory as the plugin root, and each plugin's `herdr-plugin.toml` points at
@@ -54,12 +54,17 @@ cargo clippy -- -D warnings
   docs), read the open-source herdr code there to see what the host actually does, rather than
   guessing from error messages.
 
-### Windows caveats (verified by herdr-file-viewer against herdr 0.7.1)
+### Windows caveats (verified against herdr 0.7.1 and 0.8.x)
 
-- herdr **cannot spawn a relative `[[panes]]` command on Windows** — it resolves the program
-  against herdr's own directory and fails with ERROR_PATH_NOT_FOUND. Windows launches must go
-  through an action script that spawns the binary **by absolute path** (`pane split` +
-  `pane run`), locating the plugin root via `herdr plugin list --json` (strip the `\\?\` prefix).
+- Since herdr **0.8.0**, relative action/event programs resolve against the plugin root, so the
+  Windows hooks/actions invoke `.\target\release\herdr-sidebar-ensure.exe` directly. Relative
+  `[[panes]]` commands still fail on Windows (separate upstream path, herdrdev/herdr#3024), so
+  computed docking still uses `pane split` + a shell launch inside the new pane.
+- A pane's shell is user-configurable. Never type PowerShell's `& "path"` or sh's `exec "path"`:
+  prepend the plugin binary directory to the split pane's `PATH` env and type the bare
+  `herdr-sidebar` executable name. Viewer control paths likewise travel in
+  `HERDR_SIDEBAR_PREVIEW_CONTROL`, not a shell-quoted argv. This works in PowerShell, pwsh,
+  cmd.exe, sh/bash, and nushell.
 - Action ids must be **globally unique** across platforms — use `-windows`-suffixed ids for
   the Windows variants and gate both with the item-level `platforms` key.
 - herdr panes on this machine run **Windows PowerShell 5.1**: chain with `;` / `if ($?)`,
@@ -88,11 +93,12 @@ cargo clippy -- -D warnings
   merging; clippy findings differ per-OS (a unix-only helper passes CI's ubuntu leg but fails
   `-D warnings` dead_code on Windows).
 - **Propagating a rebuild to every workspace**: plugin registration is global (one `plugin link`
-  serves all workspaces), but stale panes keep old binaries AND a dead-but-open Explorer/Sidebar
-  pane blocks the ensure hook's re-dock (it matches by label/token, not liveness). Run
+  serves all workspaces), but panes that survive a rename-aside rebuild keep running old binaries;
+  corpse healing replaces dead/tokenless panes, not a still-live pane on the old build. Run
   `herdr plugin action invoke herdr-sidebar.redeploy-windows` after rebuilding: it closes
-  every herdr-aa pane in every workspace, kills stragglers, and re-docks the focused workspace;
-  the others re-dock via the focus hook the moment they're next visited.
+  Explorer/Source Control/Sidebar panes in every workspace, reaps only the ensure sidecar, and
+  re-docks the focused workspace; preview/editor panes survive so unsaved buffers are preserved.
+  The others re-dock via the focus hook the moment they're next visited.
 - **os error 5 can come from ANOTHER Windows account**: if a second account's herdr session
   runs sidebar panes from this same checkout, its processes show empty Path/StartTime in
   `Get-Process`, `Stop-Process` fails silently on them, and redeploy from this account can't
@@ -171,25 +177,35 @@ Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema
   sometimes more) and hook invocations run concurrently: an unguarded ensure-pane hook opened
   FOUR duplicate panes on one switch. Serialize hook bodies with an atomic `mkdir` lock (with a
   stale-lock timeout) and snapshot `pane list` only after acquiring it.
+- The manifest hooks `tab.focused`, NOT `workspace.focused`: Herdr 0.8's workspace event
+  carries only `workspace_id`, so a multi-tab workspace cannot identify the active tab and
+  its snooze marker safely. `tab.focused` is emitted on the same switch and is unambiguous.
+- Workspace-scoped create events have no tab-level snooze to respect. Never borrow the
+  globally focused tab's marker for a different workspace; an empty/legacy scope may still
+  fall back to the focused tab.
 - Never hook `pane.*` events from a script that itself creates panes — feedback loop.
 
 Pane environment: `HERDR_PANE_ID` is set inside every pane's shell; `HERDR_BIN_PATH` is injected
 for **actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via
 `pane run` gets no `HERDR_PLUGIN_CONTEXT_JSON`; root it from its cwd (pass `--cwd` at split).
+Our split env forwards `HERDR_PLUGIN_STATE_DIR` and prepends the binary directory to `PATH`.
 
 Console flashes from hooks (Windows 11, verified live):
 
 - Any **console process in a hook/action chain briefly flashes a Windows Terminal window**
   when WT is the default terminal — even though herdr spawns plugin commands with
   CREATE_NO_WINDOW. Two hooks per tab switch made every pane-focus flash multiple windows.
-  Fix: keep the whole chain GUI-subsystem — `wscript //B scripts/x.vbs` (PATH-resolvable, no
-  console) launching a Rust sidecar built with `#![cfg_attr(windows, windows_subsystem =
-  "windows")]` that talks to the **socket API directly** and spawns nothing.
+  Fix: keep the whole chain GUI-subsystem — a Rust sidecar built with
+  `#![cfg_attr(windows, windows_subsystem = "windows")]` talks to the **socket API directly**
+  and spawns nothing. Herdr 0.8+ can invoke that sidecar by its plugin-relative path, so no
+  `wscript`/VBS bootstrap is needed.
 - Hook/action commands run with **cwd = plugin root** (`runtime.rs` sets `current_dir`), so a
   relative script **argument** (`scripts/x.vbs`) resolves — the *program* itself still cannot
   be a relative path (resolved against herdr's own dir).
-- Rebuilds fail while any plugin exe is running; stray TUI processes can outlive their closed
-  panes — `Get-Process herdr-sidebar | Stop-Process` before `cargo build --release`.
+- Rebuilds fail while any plugin exe is running; never kill `herdr-sidebar.exe` broadly because
+  a surviving preview pane may contain an unsaved editor buffer. Close preview/editor tabs
+  deliberately before `cargo build --release`, or use the rename-aside flow above and let old
+  processes exit naturally. Redeploy reaps only the short-lived ensure sidecar.
 
 Socket API (what the CLI wraps; usable directly from plugins, no subprocess needed):
 
@@ -303,6 +319,27 @@ HACKING.md — budget time for that before promising a patched build.
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
 
+### Following the neighbour pane's folder
+
+- A pane's `cwd` is its SPAWN directory; only `foreground_cwd` is live after a shell
+  `cd` or an agent project switch. Following therefore requires `foreground_cwd` and
+  deliberately has NO fallback to `cwd`: an absent live value is safer than silently
+  re-rooting to a stale directory.
+- "Follow pane folder" is persisted as `follow_cwd` in `state.json` and defaults on,
+  including for state files written before the field existed. Both views sample on the
+  existing ~5s heartbeat and share one process-local `CwdFollower`, so precedence survives
+  an app rebuild and unified-view switch.
+- Multi-pane precedence is deterministic: focused eligible sibling, then the previously
+  followed sibling, then lexical pane id. Candidate lists are sorted before selection;
+  `pane.list` response order is never treated as meaningful. Explorer, Source Control,
+  Sidebar, and Preview panes are ineligible so plugin panes cannot chase each other.
+- A successful typed/native folder choice is a manual override. Focus changes, response
+  reordering, and newly-created panes do not overwrite it; following resumes only when an
+  already-observed eligible pane's `foreground_cwd` changes. Turning following back on
+  resets the baseline and immediately adopts the deterministic neighbour on the next beat.
+- Source Control pauses cwd-follow while any repository has a non-empty commit-message draft;
+  rebuilding the app for another cwd would otherwise destroy that in-memory draft.
+
 ### Pane liveness (heartbeat tokens)
 
 - **You cannot detect a dead TUI from outside**: `pane.process_info` shows only the shell
@@ -354,16 +391,22 @@ HACKING.md — budget time for that before promising a patched build.
   forwards it via the `env` param (`state::spawn_env`). Legacy
   `%APPDATA%\herdr\aa-sidebar.json` is migrated on first load. A fresh sidebar opens on
   the last-active view.
+- Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
+  Never write an app's startup snapshot wholesale: preview tabs run independent sidebar
+  processes, and a stale snapshot silently reverts newer settings from another tab.
+- `dock_right` in the same state file (default false) drives the “Dock on the right” Settings
+  row. Launch target/ratio/swap, resize direction, and full-height repair all mirror from that
+  one persisted choice. Preview tabs inherit it when the `tab.created` hook docks their sidebar.
 - The unified pane reports BOTH identity tokens (`herdr-sidebar-explorer`,
   `herdr-sidebar-git`) so either launcher decision finds it; turning unified off clears
   the other token (null value — report_metadata MERGES token maps).
 - `c` (or "Change Folder…" in the context menu / both ⚙ Settings modals) re-roots the
-  sidebar via the NATIVE OS folder picker (`rfd`, Windows IFileDialog / macOS NSOpenPanel;
-  verified live on Windows). The dialog runs on a BACKGROUND thread polled from the event
-  loop — a blocking call would freeze the TUI and the liveness heartbeat would declare the
-  pane a corpse after 20s. "Change Folder (Type Path)…" keeps the typed prompt (absolute,
-  relative, or ~-prefixed); either path swaps the PROCESS cwd, so the other view follows
-  on its next switch.
+  sidebar via the native OS folder picker: `rfd`/IFileDialog on Windows and an `osascript`
+  `choose folder` subprocess on macOS; Linux keeps the typed-path prompt. The dialog runs
+  on a BACKGROUND thread polled from the event loop — a blocking call would freeze the TUI
+  and the liveness heartbeat would declare the pane a corpse after 20s. "Change Folder
+  (Type Path)…" accepts absolute, relative, or ~-prefixed paths. A successful choice marks
+  the shared cwd follower as manually overridden before rebuilding either view.
 - "Open with Default App" (`actions::open_external`, in the Explorer menu for FILE rows
   only and in the SCM file menu unless the entry's status letter is `D`) hands the path to
   the OS shell association. Windows uses `explorer.exe <path>`, NOT `cmd /c start`: explorer
@@ -381,6 +424,13 @@ HACKING.md — budget time for that before promising a patched build.
   List AUTO-SCROLLS to keep its selection visible, which fights wheel-scrolling — both
   views therefore window their rows manually (selected/scroll/snap fields) and render
   a plain List of the visible slice.
+- **`m` opens the context menu from the keyboard** in BOTH views (issue #18: moshi and
+  other mobile herdr clients have no right-click at all, and `pane send-keys` can't send
+  one either). It routes through the same builder ctrl+right-click uses, so the menus
+  can never drift apart; the explorer anchors the popup under the selected row via
+  `selection_anchor`, the SCM view via its existing `row_y`. The footer hint reads
+  `m / ctrl+rclick: menu` — same width as the old `ctrl+rclick for menus`, so it still
+  fits a ~34-col pane.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
@@ -396,6 +446,53 @@ HACKING.md — budget time for that before promising a patched build.
   single-cell**, and a trailing slack cell pushes the glyph's right edge to the chip's
   center (user-reported live); the non-Mono build just overflows into the trailing space
   like the tree's file icons do.
+
+### Explorer git decorations & staging (`src/gitdeco.rs`, issues #19/#20)
+
+- The Explorer decorates rows from `Git::discover_all` (the SAME repo set the SCM view
+  shows) and the SAME letters `parse_status` produces — `M/A/D/R/C`, `U` untracked, `!`
+  conflict — plus `I` for ignored. `ui::status_color` is the ONE color table both views
+  read; don't reintroduce a per-view copy.
+- Decorations are **foreground-only** (`row_bg` owns selection/hover backgrounds,
+  `row_line` owns the content). A decorated row must stay readable while selected, so
+  never express a status as a background.
+- Files show the letter right-aligned; a directory shows a `●` for the loudest status
+  among its DESCENDANTS (conflict > tracked change > untracked). Ignored rows get a
+  dimmed name and NO marker.
+- Row anatomy with a marker is `[prefix][name][pad][marker][2 trailing]`: the two
+  trailing cells keep the marker clear of the overflow scrollbar (which overdraws the
+  last column), and the NAME ellipsizes so a narrow pane never loses the status.
+- **`--ignored` must NOT ride along on the main `-uall` status call**: with `-uall` git
+  expands every file inside `target/`/`node_modules/`. `Git::ignored()` is therefore a
+  second, separate `status --porcelain --ignored=traditional --untracked-files=normal`
+  run, where ignored directories collapse to one `dir/` entry.
+- With `-uall`, an **embedded git repo is reported by the parent as one untracked entry**
+  (`?? vendor/lib/`, git never descends into it). So a nested repo root can carry BOTH an
+  outer `U` and its own aggregate — `Decorations::letter` shows the louder of the two, or
+  the folder reads as merely untracked while holding real changes.
+- Refresh runs on ONE background worker per Explorer app, requested on a 2s throttle plus
+  immediately after staging and on `r`/Refresh. Periodic work backs off while that sidebar
+  pane is unfocused — preview tabs each have their own sidebar, so polling every hidden copy
+  multiplies git processes. `⚙ Settings → Git decorations` (persisted `git_deco`, exposed
+  from both views) turns polling off entirely. Separated panes re-read that field from shared
+  state on tick, or toggling it in one view leaves the other's running settings/tree stale.
+  Heartbeat/tick collection runs after every event-loop iteration so sustained input cannot
+  starve liveness.
+- **Staging never hands git a directory.** `git add -A -- <dir>` on a directory holding an
+  unregistered inner repo records a gitlink ("adding embedded git repository"), so
+  `Git::stage_under` enumerates the repo's OWN status paths under the target, drops
+  anything at or inside a nested repo root, and adds those explicitly (batched at 64 to
+  stay under Windows' ~32k command line). Ownership comes from `Git::owner_of` =
+  `git rev-parse` from the path itself, i.e. the NEAREST enclosing repo — so staging
+  inside a nested checkout stages *there*, and staging the parent stops at the boundary.
+  Verified live both ways.
+- Rename candidates always carry both destination and source paths. Staging only the
+  destination leaves the old path as an unstaged deletion, so a row or directory containing
+  either side stages the coherent rename pair.
+- `stage_under` returns `Staged { count, skipped_nested }`: a stage that skipped
+  everything must SAY it hit a nested repo, or the boundary rule reads as a silent no-op.
+- The Explorer is a filesystem tree, so a **deleted file has no row** — its `D` shows in
+  Source Control, and the containing folder's `●` is what reveals it in the tree.
 
 ### Source Control view specifics (`src/scm_app.rs`)
 
@@ -421,6 +518,9 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
+- Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
+  like Explorer decorations. Suggestion/sync worker results are still collected first so a
+  hidden pane never strands completed background work.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
   "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —
@@ -433,41 +533,148 @@ HACKING.md — budget time for that before promising a patched build.
   `prefix+b` (config.toml `[[keys.command]]` → the toggle action, like the other plugin
   binds) brings it back — or hides it again when it's focused.
 - **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the
-  shell prompt (user-reported). Esc closes overlays, then closes the tab's preview pane
-  (`viewer::close_in_tab`); only `q` quits.
+  shell prompt (user-reported). Esc closes overlays, then closes this tab's preview
+  pane if one is docked here (`viewer::close_in_tab`); only `q` quits. Inside a
+  preview TAB, Esc/`q`/the ✕ button close the whole preview tab (`close_own_pane`);
+  closing only its viewer leaves a sidebar-only husk that still looks interactive. Whole-tab
+  closure requires a post-move `hs-preview-dedicated` ownership token AND an all-plugin pane
+  whitelist; if the user added a shell/agent pane, only the viewer closes.
+
+### Preview tabs (TRIAL — combined PRs #15 + #17, branch `trial/preview-tabs-wrap`)
+
+Previews follow **VS Code's editor-tab semantics**, mapped onto herdr TABS. This
+REPLACED the old full-size park/restore mode: `preview_full`, `park_others`,
+`restore_parked`, `owner_frac`/`enforce_owner_width` and the "Full-size preview"
+setting are all gone.
+
+- Clicking a file opens it in **its own tab** and jumps there. Clicking a different
+  file **overwrites that same tab** — it is EPHEMERAL, and its tab label reads
+  `name · preview` (`*` looked like an unsaved edit). **Double-clicking** pins it
+  (the suffix drops, `pin_target`); the next file
+  then gets a fresh ephemeral tab. Selecting something that already has a tab jumps
+  to it instead of opening a second one. Both gestures work in the Explorer AND the
+  Source Control view (staged/unstaged diffs, and git-graph refs — commits, stashes,
+  branches, tags).
+- Why the inversion: full-size mode evacuated the CURRENT tab (parking the user's
+  terminals into a background "· preview" tab), and the park plan was keyed by the
+  SIDEBAR's pane id — which churns on every redeploy and every ensure-hook heal. The
+  "already parked?" guard therefore never fired for the new id, so each preview
+  parked the same terminals into yet another new tab and orphaned the previous plan;
+  nothing ever restored (eight orphaned plans in one workspace, observed). Moving the
+  preview OUT instead of moving the user's panes aside removes the failure class: the
+  user's tab is never touched and there is no restore plan to go stale.
+- State lives ON THE PANE, so it cannot outlive what it describes: the viewer stamps
+  `hs-preview-path` (a fixed 16-hex fingerprint of the document key) and pinning adds
+  `hs-preview-pinned`, both read
+  back out of `pane.list` (`previews_in` / `preview_for_doc` / `reusable_preview`).
+  Document keys distinguish a file, a diff OF that file, and a `git show` touching it
+  (`doc_key_for_file` / `doc_key_for_diff` / `doc_key_for_show`).
+- The launcher stamps document/control/heartbeat metadata synchronously after `pane.split`,
+  BEFORE moving or starting the viewer. It then moves the still-idle shell pane into the new tab
+  and starts the TUI there: moving a running crossterm TUI can invalidate its Windows input handle,
+  leaving a frozen first frame and a control file nobody reads. Viewer pane labels keep stable
+  ` · preview` / ` · editor` suffixes so a server-resumed pane with lost tokens is still
+  reclaimable; the classifier also retains the legacy `Preview · ` / `Editor · ` prefixes.
+- Preview routing treats a missing heartbeat as stale, includes label-only server-resumed viewers
+  as cleanup candidates, and closes their whole tab only when every pane is recognizably plugin-owned;
+  a real shell/agent pane forces narrow viewer cleanup. Redeploy closes/restarts sidebar panes but NEVER kills the shared
+  `herdr-sidebar` process name wholesale: a spared Preview may contain an unsaved editor buffer.
+- Herdr truncates long metadata token values (an absolute `%TEMP%` control path was shortened to
+  a different, valid-looking filename). Control metadata therefore carries only a compact basename,
+  reconstructed under the private scratch directory; document metadata uses the fixed fingerprint
+  above so long project paths cannot be truncated into routing collisions. Control files get a
+  unique pre-spawn path, carried in
+  `HERDR_SIDEBAR_PREVIEW_CONTROL` so every configurable pane shell can launch the bare
+  `herdr-sidebar --preview` command without quoting a path. The viewer stamps that path in
+  `hs-preview-control`; any sidebar can then steer the tab after its pane is moved.
+  `sweep_orphan_controls` removes legacy pane-keyed files and abandoned pre-spawn files.
+- Routing is scoped to the **caller's workspace** — a session-wide search reused
+  another project's ephemeral tab, rewrote it, and yanked focus into that space.
+- A double click pins the tab the FIRST click returned (`PreviewTarget`), not one
+  re-resolved by document key: re-resolving raced the viewer's first token stamp
+  inside the 450ms double-click window and spawned a duplicate tab.
+- Pinning also verifies that the viewer's current `hs-preview-path` ACKNOWLEDGES that
+  document. A dirty editor may reject the first click's switch; pinning its target before
+  acknowledgement would pin the old document when the user cancels. A clean switch is automatic:
+  `pin_target` polls that acknowledgement for up to 800 ms so a fast double-click does not expose
+  the normal control-file/heartbeat delay as a bogus confirmation warning.
+- The first operation that actually dirties the experimental editor pins its tab immediately.
+  Clean edit mode remains reusable; dirty editor tabs are excluded from `reusable_preview`, so a
+  file click opens a fresh preview instead of presenting a switch prompt in the dirty buffer.
+- Pinning is driven from the TREE, not the tab bar: herdr exposes no tab-bar mouse
+  event and no pin concept to plugins, so `tab.rename` (the textual preview suffix) is the only
+  display lever a plugin has.
+- New tabs come up **mirroring the view you clicked from** — the `tab.created` hook
+  docks a sidebar into the preview's tab, and it reads back the explorer's tree
+  (`tree.json`: expanded dirs + selected row, keyed by ROOT) and the SCM view
+  (`scm.json`: expanded drawers, active repo, selected row by repo-qualified stable id,
+  FILE HISTORY target, scroll — keyed by workspace cwd AND each discovered repo root so a
+  nested-repo preview tab restores the originating state). SCM keys and active roots normalize
+  `\` to `/`: Git commonly reports forward slashes on Windows while pane cwd uses backslashes,
+  and treating them as different paths silently loses the mirror. Captured at sidebar STARTUP only,
+  deliberately not a
+  live sync; the SCM side saves on user-action paths to avoid timer write-churn. Paths
+  outside the tree's root are dropped on load, since one file serves every workspace.
+- Sidebar roots are remembered per space by **workspace LABEL, not id** — ids identify
+  a space INSTANCE, not a project (a space moved from `wG` to `wH` within one
+  session), so an id-keyed root lands under an unrelated space. Every successful manual or
+  followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
+- The ensure hook roots a docked sidebar from **the event's own tab**
+  (`--event-scope` → `launch_decision_in` / `focused_pane_in`): during a workspace
+  switch the globally focused pane is still the space you came from. The Windows
+  ensure SIDECAR (`src/ensure.rs`) carries the same scoping — PR #15 scoped only the
+  unix `ensure-sidebar.sh`, so without this Windows kept the old cross-space bug.
+  Toggles stay unscoped (a deliberate act on the focused tab).
 
 ### Diff preview
 
-- Previews/diffs open FULL-SIZE by default — everything beside the sidebar, sidebar
-  still visible (user-rejected the zoom approach, which covered it). Mechanism: the
-  tab's other panes are PARKED — `pane.move`d into a background "· preview" tab — with
-  their rects recorded in a plan file beside the control file; the viewer then splits
-  the momentarily-full-width sidebar at its PRE-park width fraction (captured before the
-  park — measuring after reads 100%). Esc (either process; both read the plan) moves
-  them home by guillotine-recovering the split tree from the recorded rects and
-  replaying it pre-order (first pane splits the viewer, each split re-splits the
-  first-subtree's top-left pane at the recorded ratio), then `layout.set_split_ratio`
-  restores the sidebar's width. Verified: exact rects round-trip. Zoom would NOT work
-  here: it covers the whole tab, and same-tab `pane.move` being a no-op is why parking
-  bounces through a real background tab. Stale plans (viewer died with panes parked,
-  e.g. redeploy) self-heal on the next preview open. **Measure the sidebar's width
-  fraction FIRST, before closing a stale viewer**: the close leaves the sidebar
-  momentarily alone at full width, and a post-close measurement reads a meaningless
-  ~1.0 (clamped to 0.5, that was the half-width-sidebar bug). `owner_frac` treats
-  any fraction outside 0.02..0.55 as no-signal (`None` → 0.3 fallback), and after
-  the viewer opens `enforce_owner_width` pins the root split to the pre-click
-  fraction so the width is deterministic whichever spawn path ran. "Full-size preview" in ⚙ Settings
-  (persisted `preview_full`, default on) reverts to the 50/50 beside-mode split.
 - Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
-  shows its colored `git diff` in the SAME preview pane the explorer uses: the control
-  file carries typed requests (`file/<path>` / `diff/<root>/<rel>/<kind>`, tab-separated),
-  diffs render VS Code-style via the in-crate `diffview.rs` — OUR parse of plain
-  `git diff` (dual old/new gutters, full-width red/green row tints padded at draw time,
-  darker word-level tint on paired changed lines, syntax-highlighted code through two
-  stateful `LineHighlighter`s for old/new contexts). `ansi.rs` (SGR parser) still renders
-  `git show` output (ansi-to-tui pins an older ratatui — don't add it), and diffs re-run
-  every ~2s so they live-update.
+  shows its colored `git diff` in a preview tab, the same way the explorer opens
+  files: the control file carries typed requests (`file/<path>` /
+  `diff/<root>/<rel>/<kind>`, tab-separated), diffs render VS Code-style via the
+  in-crate `diffview.rs` — OUR parse of plain `git diff` (dual old/new gutters,
+  full-width red/green row tints, darker word-level tint on paired changed lines,
+  syntax-highlighted code through two stateful `LineHighlighter`s for old/new
+  contexts). `ansi.rs` (SGR parser) still renders `git show` output (ansi-to-tui pins
+  an older ratatui — don't add it), and diffs re-run every ~2s so they live-update.
+  The refresh runs on a worker thread so a slow Git process cannot starve the viewer heartbeat;
+  unchanged output is left in place so a mouse selection is not erased every two seconds.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
+
+### Long-line wrapping in the preview (`src/wrap.rs`)
+
+- Long lines WRAP by default; `w` toggles wrapping off for the current document
+  (per-document — a newly loaded doc starts wrapped again), and the footer shows which
+  state you are in.
+- Tabs always expand to 4-column stops through `wrap_line`, even with wrapping off or when
+  ratatui's raw Unicode width says the line fits (it counts C0 tab as width zero).
+- **Do NOT wrap with ratatui's `Paragraph::wrap`** here. The viewer slices the visible
+  lines out of the doc BEFORE handing them to the Paragraph, so the widget's
+  continuation rows render past the bottom of the pane and a scroll that counts SOURCE
+  lines can never bring them back: the tail of a wrapped file is unreachable, and a
+  line taller than the pane is permanently clipped. (That was the flaw in PR #17 as
+  submitted.)
+- The fix: the viewer wraps the lines ITSELF (`wrap::wrap_line`) into a `Vec<Row>` of
+  RENDERED rows, each tagged with the source line it came from, and `doc.scroll`
+  indexes THOSE. Every continuation is then an ordinary scrollable row — ↑↓, page,
+  `g`/`G`, the wheel and the end-of-doc clamp all count rendered rows. `wrap_line` is a
+  greedy word wrap over a flat (char, width, style) run: it breaks at the last space
+  that fits, hard-breaks a word wider than the pane (nothing is ever dropped), never
+  trims indentation, measures with `unicode-width` (wide CJK = 2 cells), preserves
+  per-span styles across a break, and carries the LINE style so a wrapped diff row
+  keeps its tint — every row is padded to the pane edge, so continuations get the
+  full-width band too.
+- Rows are cached per `(width, wrap)` and rebuilt only when one of those changes — a
+  resize or a `w` press, not every frame.
+- Both the `w` toggle and the ~2s diff live-refresh re-anchor the scroll by SOURCE
+  LINE (`Doc::top_src` → `Doc::pending_src`), so the reader keeps their place even
+  though every row index underneath them moved.
+- The line-number gutter numbers the FIRST row of a source line and indents
+  continuations to the same column, like an editor.
+- Read-only previews still support terminal-native interaction despite mouse capture: click/drag
+  selects rendered text, Shift+click extends it, and Ctrl/Cmd+C copies it. Selection preserves
+  syntax/diff styling on screen, omits file line-number gutters, and does not insert newlines at
+  visual wrap boundaries.
 
 ### Syntax highlighting (file preview)
 
@@ -478,6 +685,31 @@ HACKING.md — budget time for that before promising a patched build.
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
 
+### Experimental in-pane editor (issue #22)
+
+- `e` enters edit mode ONLY from a regular file preview. Diff / `git show`, binary,
+  invalid-UTF-8, >1 MiB, and >5000-line content stays read-only. Editor state lives in
+  `src/editor.rs`; do not fold editable text back into `Doc`, whose styled lines are the
+  deliberately read-only preview/diff representation.
+- Editor positions are Unicode-scalar columns, never byte offsets. Visual navigation and
+  scrolling use `wrapped_rows` (word-boundary first, hard-wrap only when a word cannot fit),
+  so `scroll` is a WRAPPED-ROW index rather than a source-line index. UTF-8 BOM and the
+  detected LF/CRLF convention round-trip on explicit Ctrl/Cmd+S saves.
+- The loaded/saved raw bytes are the external-change baseline. A clean buffer reloads a
+  valid external change; a dirty buffer warns and save returns a conflict until the user
+  explicitly chooses overwrite or reload. Do not replace this with mtime-only detection —
+  coarse timestamps and same-length rewrites can miss real changes.
+- Sidebar Esc cannot directly `pane.close` a live preview anymore: pane close kills the TUI
+  before it can confirm dirty state. `close_in_tab` writes a `close` control request; the
+  viewer confirms save/discard/cancel and then closes itself (stale viewers are still killed
+  directly). The same prompt guards control-file switches to another preview.
+- Clipboard is best-effort and command-backed: `clip` / PowerShell `Get-Clipboard` on
+  Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Ctrl and Cmd
+  shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr layouts work.
+- Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
+  wrapped rows, and Shift+click extends the current selection. Coordinates account for the line
+  number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset.
+
 ### Verifying a plugin TUI end-to-end
 
 Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
@@ -486,7 +718,10 @@ required), then `pane run <id> "& '<abs path to exe>'"` (PS call operator — a 
 splits on spaces), then `pane send-keys <id> Down Enter …`, capture with
 `pane read <id> --source visible`, and confirm side effects with plain `git` commands in
 the scratch repo. Close the pane when done. Cheap, and it catches layout truncation bugs
-unit tests can't. Run the TUI with `$env:HERDR_PANE_ID=''` so it skips identity-token
+unit tests can't. **Build the verification binary into its OWN target dir**
+(`cargo build --release --target-dir target/verify`): a different exe path can't collide
+with the running sidebar's Windows exe lock, so no rename-aside dance and the user's live
+panes keep running. Delete the dir afterwards. Run the TUI with `$env:HERDR_PANE_ID=''` so it skips identity-token
 reporting — otherwise the test pane registers as a real sidebar and the tab's launcher/
 ensure logic can fight over it.
 
@@ -580,10 +815,12 @@ Hard-won capture gotchas:
   later widen — the email comes back. The pane width at capture time is what counts.
 - The sidebar's `state.json` is **GLOBAL** (%LOCALAPPDATA%\herdr\plugins\herdr-sidebar
   — shared with the user's real session!). The separated shot toggles unified off and
-  needs `preview_full:false` (edit the file directly; the settings-modal Down-count is
-  view-dependent) — RESTORE merged:true + preview_full:true when done.
+  needs the diff BESIDE the sidebar rather than in its own tab — with preview tabs
+  (the trial branch) the diff lives in a separate tab, so compose that shot by
+  moving the preview pane back into the staging tab (`pane.move`) before capturing.
+  RESTORE merged:true when done. (`preview_full` no longer exists.)
 - Separated shot composition: after toggling, pin Source Control to 38 cols
-  (root ratio 0.275), open the routes.rs diff (beside mode), then `pane swap` the
+  (root ratio 0.275), open the routes.rs diff in a preview tab, then `pane swap` the
   viewer to the far right so it reads SC | Explorer | diff.
 - The spaces list order = workspace CREATION order; recreating a workspace mid-shoot
   sends it to the bottom — recreate ALL of them in roster order.
@@ -638,9 +875,19 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
 - The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
   installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
   their persisted value).
+- **Do not use rfd for the background picker on macOS.** Its Cocoa backend requires the
+  main thread or a running `NSApplication`; a terminal TUI has neither, so the worker-thread
+  call aborts the pane. Moving it to the main thread would freeze the heartbeat instead.
+  `actions::pick_folder` uses `osascript -e 'POSIX path of (choose folder …)'`: omit
+  `default location` when the old root is no longer a directory, escape backslashes before
+  quotes in AppleScript literals, treat a non-zero status (including cancel `-128`) as no
+  selection, and trim the returned trailing slash without turning `/` into an empty path.
+  The parser is separated from process launch so all of these cases run in cross-platform
+  unit tests. `rfd` remains Windows-only; Linux behavior is unchanged.
 - Everything else verified working on macOS unchanged: ensure hook docks on tab focus,
-  unified view switch, SCM drawers/commit box in a real repo, full-size diff preview with
-  park/restore round-trip, first-run Nerd Font prompt (curl+unzip path), heartbeat tokens,
+  unified view switch, SCM drawers/commit box in a real repo, the diff preview
+  (full-size park/restore at the time; preview TABS on the trial branch),
+  first-run Nerd Font prompt (curl+unzip path), heartbeat tokens,
   herdr-notes toggle.
 
 ## Herdr workspace

@@ -17,6 +17,34 @@ use crate::state::View;
 pub const KEYCAP_BG: Color = Color::Rgb(0x32, 0x36, 0x3d);
 pub const KEYCAP_FG: Color = Color::Rgb(0xc9, 0xce, 0xd6);
 
+// VS Code's dark-theme git decoration colors, shared by the Source Control
+// rows and the Explorer's status decorations (issue #19) so one status letter
+// always means one color.
+pub const MODIFIED: Color = Color::Rgb(0xe2, 0xc0, 0x8d);
+pub const UNTRACKED: Color = Color::Rgb(0x73, 0xc9, 0x91);
+pub const ADDED: Color = Color::Rgb(0x81, 0xb8, 0x8b);
+pub const RENAMED: Color = Color::Rgb(0x73, 0xc9, 0x91);
+pub const DELETED: Color = Color::Rgb(0xc7, 0x4e, 0x39);
+pub const CONFLICT: Color = Color::Rgb(0xe4, 0x67, 0x6b);
+/// Ignored paths render faded, like VS Code's `gitDecoration.ignoredResourceForeground`.
+pub const IGNORED: Color = Color::Rgb(0x6b, 0x6b, 0x6b);
+
+/// The color for a git status letter (`crate::git::FileEntry::letter`, plus
+/// `I` for ignored). Shared vocabulary: the Explorer decorations and the
+/// Source Control list must never disagree about what `M` looks like.
+pub fn status_color(letter: char) -> Color {
+    match letter {
+        'M' => MODIFIED,
+        'U' => UNTRACKED,
+        'A' => ADDED,
+        'R' | 'C' => RENAMED,
+        'D' => DELETED,
+        '!' => CONFLICT,
+        'I' => IGNORED,
+        _ => Color::Reset,
+    }
+}
+
 /// Rendered width of one `key label` hint: keycap padding + gap + label.
 fn hint_width(key: &str, label: &str) -> usize {
     Span::raw(key).width() + 2 + 1 + Span::raw(label).width()

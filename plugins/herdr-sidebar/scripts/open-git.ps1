@@ -1,22 +1,19 @@
 # open-git-panel.ps1 -- Windows launcher for the herdr-aa-git source control pane.
 #
 # Idempotent "launch-or-focus, toggle on repeat", scoped to the current tab:
-#   - no Source Control pane in the current tab      -> open one, DOCKED ON THE LEFT edge
+#   - no Source Control pane in the current tab      -> open at the configured dock edge
 #   - a Source Control pane exists but isn't focused -> focus it
 #   - the focused pane IS the Source Control pane    -> close it (toggle off)
 #
-# Left dock: herdr's `pane split` only splits right/down, so we split the tab's
-# LEFTMOST pane (the one touching the spaces/agents sidebar) to the right with a
-# small left-slot ratio, then `pane swap` the new pane into that left slot.
-# Verified against herdr 0.7.1 (by herdr-aa-filetree, whose launcher this mirrors):
-# the split `--ratio` is the ORIGINAL pane's share, and after a swap the focus
-# stays with the SLOT, not the pane.
+# Left docking splits the leftmost pane and swaps into its narrow slot. Right
+# docking splits the rightmost pane with the inverse original-pane ratio and
+# needs no swap. The unit-tested --open-plan output owns that choice.
 #
 # Windows caveats inherited from herdr-file-viewer (see its herdr-plugin.toml):
 # herdr cannot spawn a relative [[panes]] command on Windows (ERROR_PATH_NOT_FOUND),
-# so we spawn the binary BY ABSOLUTE PATH via `pane split` + `pane run`, and the
-# pane-id / target / ratio decisions come from the binary's tested stdin modes
-# (--launch-decision git / --focused-pane / --open-plan), never from ad-hoc parsing.
+# so we use `pane split`, prepend the binary directory to that pane's PATH, and
+# type a shell-agnostic bare executable name. Pane-id / target / ratio decisions
+# come from the binary's tested stdin modes, never from ad-hoc parsing.
 
 $ErrorActionPreference = 'Continue'
 
@@ -34,6 +31,8 @@ function Strip-Verbatim([string]$p) {
 }
 $PluginRoot = Strip-Verbatim (Split-Path -Parent $PSScriptRoot)
 $Bin = Join-Path $PluginRoot 'target\release\herdr-sidebar.exe'
+$BinDir = Split-Path -Parent $Bin
+$LaunchPath = "$BinDir;$env:PATH"
 
 if (-not (Test-Path $Bin)) {
     Write-Error "herdr-sidebar.exe not found at $Bin -- run 'cargo build --release' in the plugin directory first."
@@ -52,31 +51,48 @@ function Open-Pane {
     $fp = ($PanesJson | & $Bin --focused-pane).Trim()
     if (-not $fp) {
         # No focused pane known: best-effort plain split beside the current pane.
-        $out = (& $HerdrBin pane split --current --direction right --ratio 0.75 | Out-String)
+        $splitArgs = @('pane', 'split', '--current', '--direction', 'right', '--ratio', '0.75',
+            '--env', "PATH=$LaunchPath")
+        if ($env:HERDR_PLUGIN_STATE_DIR) {
+            $splitArgs += @('--env', "HERDR_PLUGIN_STATE_DIR=$env:HERDR_PLUGIN_STATE_DIR")
+        }
+        $out = (& $HerdrBin @splitArgs | Out-String)
         $np = Get-PaneId $out
-        if ($np) { & $HerdrBin pane run $np "& \`"$Bin\`" --view git" }
+        if ($np) { & $HerdrBin pane run $np 'herdr-sidebar --view git' }
         exit 0
     }
     $FocusedId, $FocusedCwd = $fp -split "`t", 2
 
-    # Left-dock plan: leftmost pane of the focused tab + the left-slot ratio.
     $Target = $FocusedId
-    $Ratio = '0.25'
+    if ((& $Bin --dock-right).Trim() -eq 'right') {
+        $Ratio = '0.75'
+        $NeedsSwap = $false
+    } else {
+        $Ratio = '0.25'
+        $NeedsSwap = $true
+    }
     $plan = ((& $HerdrBin pane layout --pane $FocusedId | Out-String) | & $Bin --open-plan).Trim()
-    if ($plan) { $Target, $Ratio = $plan -split "`t", 2 }
+    if ($plan) {
+        $Target, $Ratio, $swapText = $plan -split "`t", 3
+        $NeedsSwap = $swapText -eq 'true'
+    }
 
-    $splitArgs = @('pane', 'split', $Target, '--direction', 'right', '--ratio', $Ratio, '--no-focus')
+    $splitArgs = @('pane', 'split', $Target, '--direction', 'right', '--ratio', $Ratio,
+        '--no-focus', '--env', "PATH=$LaunchPath")
     if ($FocusedCwd) { $splitArgs += @('--cwd', $FocusedCwd) }
+    if ($env:HERDR_PLUGIN_STATE_DIR) {
+        $splitArgs += @('--env', "HERDR_PLUGIN_STATE_DIR=$env:HERDR_PLUGIN_STATE_DIR")
+    }
     $out = (& $HerdrBin @splitArgs | Out-String)
     $np = Get-PaneId $out
     if (-not $np) { exit 1 }
 
-    # Move the new pane into the left slot, then start the panel in it.
-    & $HerdrBin pane swap --source-pane $np --target-pane $Target *> $null
-    # Absolute path via the PowerShell CALL OPERATOR: a bare path splits on spaces
-    # in the install path, and the `\"` escaping survives PS 5.1's native-arg
-    # quote-stripping so herdr receives the quotes intact (herdr-file-viewer GH #58).
-    & $HerdrBin pane run $np "& \`"$Bin\`" --view git"
+    # Left docking swaps into the narrow left slot; right docking is already
+    # in place. PATH makes the bare launch independent of the pane's shell.
+    if ($NeedsSwap) {
+        & $HerdrBin pane swap --source-pane $np --target-pane $Target *> $null
+    }
+    & $HerdrBin pane run $np 'herdr-sidebar --view git'
     & $HerdrBin pane rename $np 'Source Control' *> $null
     # Wait for the TUI's identity token so queued ensure hooks see a LIVE
     # pane (the corpse rule replaces label-without-token panes).
@@ -109,6 +125,7 @@ if ($Decision -like 'FOCUS *') {
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
     $PaneId = $Decision.Substring(8)
     & $HerdrBin pane close $PaneId *> $null
+    $PanesJson = (& $HerdrBin pane list | Out-String)
     Open-Pane
 } else {
     Open-Pane
