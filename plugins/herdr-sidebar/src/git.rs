@@ -969,20 +969,27 @@ mod tests {
     #[test]
     fn owner_of_resolves_to_the_nearest_enclosing_repository() {
         let (outer, inner) = nested_repo_fixture("owner");
+        let outer_root = std::fs::canonicalize(&outer.root).unwrap();
+        let inner_root = std::fs::canonicalize(&inner.root).unwrap();
         assert_eq!(
-            Git::owner_of(&outer.root.join("src/app.rs")).unwrap().root,
-            outer.root
+            std::fs::canonicalize(Git::owner_of(&outer.root.join("src/app.rs")).unwrap().root)
+                .unwrap(),
+            outer_root
         );
         assert_eq!(
-            Git::owner_of(&outer.root.join("src")).unwrap().root,
-            outer.root
+            std::fs::canonicalize(Git::owner_of(&outer.root.join("src")).unwrap().root).unwrap(),
+            outer_root
         );
         // Inside the nested checkout the INNER repo owns the path.
         assert_eq!(
-            Git::owner_of(&inner.root.join("inner.rs")).unwrap().root,
-            inner.root
+            std::fs::canonicalize(Git::owner_of(&inner.root.join("inner.rs")).unwrap().root)
+                .unwrap(),
+            inner_root
         );
-        assert_eq!(Git::owner_of(&inner.root).unwrap().root, inner.root);
+        assert_eq!(
+            std::fs::canonicalize(Git::owner_of(&inner.root).unwrap().root).unwrap(),
+            inner_root
+        );
         let _ = std::fs::remove_dir_all(&outer.root);
     }
 

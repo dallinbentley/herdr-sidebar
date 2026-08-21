@@ -8,9 +8,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -577,10 +575,9 @@ impl Editor {
             self.cursor.col += char_len(parts[0]);
             self.lines[self.cursor.line].push_str(&tail);
         } else {
-            let mut insert_at = self.cursor.line + 1;
-            for part in &parts[1..] {
-                self.lines.insert(insert_at, (*part).to_string());
-                insert_at += 1;
+            for (offset, part) in parts[1..].iter().enumerate() {
+                self.lines
+                    .insert(self.cursor.line + 1 + offset, (*part).to_string());
             }
             self.cursor.line += parts.len() - 1;
             self.cursor.col = char_len(parts.last().copied().unwrap_or_default());
