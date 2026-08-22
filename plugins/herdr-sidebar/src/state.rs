@@ -189,7 +189,7 @@ impl Default for State {
 pub fn follow_cwd_setting_value(enabled: bool) -> String {
     let value = if enabled { "on" } else { "off" };
     if cfg!(windows) {
-        format!("{value} (host unsupported)")
+        format!("{value} (host n/a)")
     } else {
         value.to_string()
     }
@@ -849,6 +849,17 @@ mod tests {
         assert_eq!(step_sidebar_width(MIN_SIDEBAR_WIDTH, false), MIN_SIDEBAR_WIDTH);
         assert_eq!(step_sidebar_width(1, true), 28);
         assert_eq!(step_sidebar_width(u16::MAX, false), 76);
+    }
+
+    #[test]
+    fn follow_cwd_status_stays_compact() {
+        if cfg!(windows) {
+            assert_eq!(follow_cwd_setting_value(true), "on (host n/a)");
+            assert_eq!(follow_cwd_setting_value(false), "off (host n/a)");
+        } else {
+            assert_eq!(follow_cwd_setting_value(true), "on");
+            assert_eq!(follow_cwd_setting_value(false), "off");
+        }
     }
 
     #[test]

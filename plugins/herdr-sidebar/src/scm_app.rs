@@ -1946,7 +1946,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ toggle · ←/→ width · esc close".dim()));
+        lines.push(Line::from(" click/⏎ · ←/→ width · esc".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
