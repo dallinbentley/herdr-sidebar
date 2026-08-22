@@ -153,6 +153,13 @@ pub struct State {
     /// open-sidebar toggle themselves (issue #8); the explicit toggle always
     /// works regardless.
     pub auto_open: bool,
+    /// The open-sidebar toggle treats an open-but-unfocused sidebar as CLOSE
+    /// instead of FOCUS: one press opens, the next press closes, wherever
+    /// focus is. Off keeps the historical open / focus / close cycle.
+    pub strict_toggle: bool,
+    /// Focus the sidebar once the toggle opens it. Off docks it in the
+    /// background: focus stays in the pane the toggle was invoked from.
+    pub focus_on_open: bool,
     /// Follow the live foreground cwd of a non-sidebar pane in this tab.
     /// Manual folder choices win until an already-observed pane changes cwd.
     pub follow_cwd: bool,
@@ -178,6 +185,8 @@ impl Default for State {
             icons: None,
             font_prompt_done: false,
             auto_open: true,
+            strict_toggle: false,
+            focus_on_open: true,
             follow_cwd: true,
             git_deco: true,
             dock_right: false,
@@ -318,12 +327,14 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
         state.font_prompt_done,
         state.auto_open,
+        state.strict_toggle,
+        state.focus_on_open,
         state.follow_cwd,
         state.git_deco,
         state.dock_right,
@@ -690,6 +701,14 @@ pub fn parse_state(json: &str) -> State {
             .get("auto_open")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.auto_open),
+        strict_toggle: value
+            .get("strict_toggle")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.strict_toggle),
+        focus_on_open: value
+            .get("focus_on_open")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.focus_on_open),
         follow_cwd: value
             .get("follow_cwd")
             .and_then(|v| v.as_bool())
@@ -818,17 +837,23 @@ mod tests {
             icons: Some(crate::icons::IconTheme::Emoji),
             font_prompt_done: true,
             auto_open: false,
+            strict_toggle: true,
+            focus_on_open: false,
             follow_cwd: false,
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
         // decorations on.
         assert!(parse_state("{\"merged\":true}").auto_open);
+        // Files written before the toggle settings existed keep the
+        // historical toggle behavior: focus an open sidebar, focus on open.
+        assert!(!parse_state("{\"merged\":true}").strict_toggle);
+        assert!(parse_state("{\"merged\":true}").focus_on_open);
         // Existing installs get neighbour following by default.
         assert!(parse_state("{\"merged\":true}").follow_cwd);
         assert!(parse_state("{\"merged\":true}").git_deco);

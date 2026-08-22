@@ -291,6 +291,17 @@ pub fn launch_decision_in(pane_list_json: &str, now: u64, scope: &str) -> String
     }
 }
 
+/// Strict-toggle mapping (⚙ Settings): a `FOCUS` decision becomes `CLOSE`,
+/// so one toggle press opens and the next press closes, wherever focus is.
+/// Every other decision passes through untouched; kept pure so both the CLI
+/// mode and the Windows ensure sidecar share one tested mapping.
+pub fn focus_as_close(decision: &str) -> String {
+    match decision.split_once(' ') {
+        Some(("FOCUS", id)) => format!("CLOSE {id}"),
+        _ => decision.to_string(),
+    }
+}
+
 /// Source-control identity for the separated Source Control pane.
 pub const SC_PANE_LABEL: &str = "Source Control";
 pub const SC_METADATA_SOURCE: &str = "herdr-sidebar-git";
@@ -831,6 +842,17 @@ fn strip_verbatim(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strict toggle rewrites only the FOCUS decision; OPEN, CLOSE, and
+    /// REPLACE (and garbage) must reach the launchers untouched.
+    #[test]
+    fn strict_toggle_maps_focus_to_close_and_nothing_else() {
+        assert_eq!(focus_as_close("FOCUS w4:p2"), "CLOSE w4:p2");
+        assert_eq!(focus_as_close("OPEN"), "OPEN");
+        assert_eq!(focus_as_close("CLOSE w4:p2"), "CLOSE w4:p2");
+        assert_eq!(focus_as_close("REPLACE w4:p2"), "REPLACE w4:p2");
+        assert_eq!(focus_as_close(""), "");
+    }
 
     /// The decision and the dock must reason about the SAME tab. Scoping only
     /// the spawn cwd would let the decision see a focused tab with no sidebar,

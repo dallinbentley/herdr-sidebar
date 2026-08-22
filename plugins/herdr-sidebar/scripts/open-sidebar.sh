@@ -87,16 +87,25 @@ open_pane() {
 
   # Left docking swaps into the narrow left slot; right docking is already
   # in place. PATH makes the same bare launch work in any configured shell.
+  focus_open="$("$bin" --focus-on-open 2>/dev/null || echo on)"
   if [ "$needs_swap" = "true" ]; then
     "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
+    if [ "$focus_open" != "on" ] && [ "$target" = "$fid" ]; then
+      # "Focus on open: off" (⚙ Settings): the sidebar docks in the
+      # background, but the swap drags focus onto the explorer slot (focus
+      # follows the slot). Hand it back right away, the ensure hook's move.
+      "$herdr_bin" pane focus --direction right --pane "$np" >/dev/null 2>&1 || true
+    fi
   fi
   "$herdr_bin" pane run "$np" "herdr-sidebar"
   "$herdr_bin" pane rename "$np" Explorer >/dev/null 2>&1 || true
   # Give the TUI time to stamp its identity token before hooks re-check.
   sleep 3
-  # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
-  "$herdr_bin" pane zoom "$np" --on >/dev/null 2>&1 || true
-  "$herdr_bin" pane zoom "$np" --off
+  if [ "$focus_open" = "on" ]; then
+    # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
+    "$herdr_bin" pane zoom "$np" --on >/dev/null 2>&1 || true
+    "$herdr_bin" pane zoom "$np" --off
+  fi
 }
 
 decision="OPEN"
