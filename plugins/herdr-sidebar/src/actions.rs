@@ -126,7 +126,6 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
 /// Copy text to the system clipboard by piping to the platform's clipboard
 /// tool (a console child of the TUI's own pty — no window is created).
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    use std::io::Write;
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(windows))]
@@ -134,24 +133,37 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
-        let spawned = std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match spawned {
-            Ok(mut child) => {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()?;
-                return Ok(());
-            }
+        match copy_with(argv, text) {
+            Ok(()) => return Ok(()),
             Err(err) => last_err = err,
         }
     }
     Err(last_err)
+}
+
+fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new(argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("{} opened without stdin", argv[0]),
+        ));
+    };
+    stdin.write_all(text.as_bytes())?;
+    drop(stdin);
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{} exited with {status}", argv[0])))
+    }
 }
 
 /// Read text from the system clipboard when a platform clipboard command is
@@ -351,6 +363,16 @@ mod tests {
         assert_eq!(validate_name("a\\b"), None);
         assert_eq!(validate_name("C:"), None);
         assert_eq!(validate_name(".."), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_commands_must_accept_input_and_exit_successfully() {
+        assert!(copy_with(&["sh", "-c", "cat >/dev/null"], "copied").is_ok());
+        let error = copy_with(&["sh", "-c", "cat >/dev/null; exit 7"], "not copied")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exited with"), "{error}");
     }
 
     #[test]

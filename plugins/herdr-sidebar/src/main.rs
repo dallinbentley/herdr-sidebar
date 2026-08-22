@@ -61,8 +61,8 @@ fn main() -> std::io::Result<()> {
             return Ok(());
         }
         Some("--open-plan") => {
-            let dock_right = state::load_state().dock_right;
-            println!("{}", launch::open_plan(&read_stdin()?, dock_right));
+            let state = state::load_state();
+            println!("{}", launch::open_plan(&read_stdin()?, state.dock_right, state.sidebar_width));
             return Ok(());
         }
         Some("--event-kind") => {
@@ -222,6 +222,10 @@ fn run_explorer(
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Resize(width, _) => {
+                    app.on_resize(width);
+                    None
+                }
                 _ => None, // resize, focus, … simply fall through to a redraw
             };
             if let Some(exit) = exit {
@@ -257,6 +261,10 @@ fn run_scm(
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Resize(width, _) => {
+                    app.on_resize(width);
+                    None
+                }
                 _ => None,
             };
             if let Some(exit) = exit {

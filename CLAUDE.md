@@ -365,6 +365,11 @@ HACKING.md — budget time for that before promising a patched build.
   identity token itself, synchronously, right after `pane.split` and BEFORE
   `pane run` — there is then no token-less window at all, so no wait/poll is
   needed. Worth adopting if the launchers are ever reworked.
+- A focus event may yield when the ensure lock is held because another focus event follows, but
+  `tab.created` is discrete. Unix AND the Windows sidecar must wait for the lock (the same
+  20 × 0.5 s budget as a manual toggle), or a preview tab created during the first-token wait
+  can permanently miss its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON
+  discriminator as `tab_created`; manifest hook names remain dotted (`tab.created`).
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
@@ -391,6 +396,10 @@ HACKING.md — budget time for that before promising a patched build.
   forwards it via the `env` param (`state::spawn_env`). Legacy
   `%APPDATA%\herdr\aa-sidebar.json` is migrated on first load. A fresh sidebar opens on
   the last-active view.
+- Sidebar width is a persisted column target (32 by default, 24–80 in 4-column steps), not
+  a frozen split ratio. A change to the whole tab area re-applies it through the ratio-aware
+  resize path; a pane-only divider resize is respected for the current layout instead of
+  snapping back. The existing 15%–50% share bounds still win at extreme tab widths.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
   Never write an app's startup snapshot wholesale: preview tabs run independent sidebar
   processes, and a stale snapshot silently reverts newer settings from another tab.
@@ -675,6 +684,10 @@ setting are all gone.
   selects rendered text, Shift+click extends it, and Ctrl/Cmd+C copies it. Selection preserves
   syntax/diff styling on screen, omits file line-number gutters, and does not insert newlines at
   visual wrap boundaries.
+- Preview return focus is durable pane metadata (`hs-preview-origin-tab`), not
+  `PreviewTarget.tab_id` (that is the preview tab itself). Reusing an ephemeral preview from
+  its own sidebar preserves the original origin; focus it before closing because closing the
+  current tab can kill the viewer before any follow-up IPC runs.
 
 ### Syntax highlighting (file preview)
 
@@ -706,6 +719,9 @@ setting are all gone.
 - Clipboard is best-effort and command-backed: `clip` / PowerShell `Get-Clipboard` on
   Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Ctrl and Cmd
   shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr layouts work.
+  A copy command counts only when its exit status succeeds. Do not treat writing OSC 52 bytes
+  as confirmed clipboard success: terminals provide no acknowledgement here, and unconditional
+  escape output would add a behavior/security compatibility change with no opt-out.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
   wrapped rows, and Shift+click extends the current selection. Coordinates account for the line
   number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset.

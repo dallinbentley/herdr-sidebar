@@ -57,7 +57,8 @@ A real tree, not a directory dump:
   mirroring the tree you clicked from. Your terminals are never moved. The tab is
   *ephemeral* (labelled `name · preview`), so clicking another file reuses it; **double-click**
   to pin it and the next file gets a fresh tab. Click a file that is already open and
-  you jump to its tab instead of opening it twice. Line numbers, scrolling,
+  you jump to its tab instead of opening it twice. Closing a preview returns to the tab
+  that opened it. Line numbers, scrolling,
   binary-safe, and **long lines wrap** — press `w` to switch wrapping off for the
   document you are reading.
 - **Experimental in-pane editing** — press `e` in a regular UTF-8 file preview. The editor
@@ -91,6 +92,8 @@ A real tree, not a directory dump:
   closed until you invoke the open-sidebar action yourself.
 - Prefer the tree on the other side? Toggle "Dock on the right" in ⚙ Settings; the choice
   persists for every future launch and auto-docked tab.
+- Prefer a different width? Adjust "Sidebar width" with `←`/`→` in ⚙ Settings. The column
+  target persists and is re-applied when the surrounding tab width changes.
 
 ### 🔀 Source Control
 
@@ -133,7 +136,7 @@ The ⚙ settings modal — mouse-toggleable like everything else — flips betwe
 <img src="plugins/herdr-sidebar/docs/media/settings.png" alt="The settings modal" width="920">
 </div>
 
-Dock side, icon theme, dotfile visibility, live-folder following, and the full hotkey
+Dock side, sidebar width, icon theme, dotfile visibility, live-folder following, and the full hotkey
 reference live in the same modal (with a toggle if you'd rather keep the key hints
 pinned to the sidebar's footer), and every choice persists across restarts. However you
 split it, the dock takes care of itself: a focus hook re-docks the sidebar in any tab or

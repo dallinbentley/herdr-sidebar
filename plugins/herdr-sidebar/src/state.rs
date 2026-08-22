@@ -8,6 +8,7 @@
 //!   left off.
 //! - `follow_cwd`: follow the live cwd of the neighbouring pane.
 //! - `dock_right`: dock at the right edge instead of the default left edge.
+//! - `sidebar_width`: preferred sidebar width in terminal columns.
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -17,6 +18,24 @@ use std::path::{Path, PathBuf};
 
 /// Pane label (and metadata identity) of the unified pane.
 pub const SIDEBAR_LABEL: &str = "Sidebar";
+
+pub const DEFAULT_SIDEBAR_WIDTH: u16 = 32;
+pub const MIN_SIDEBAR_WIDTH: u16 = 24;
+pub const MAX_SIDEBAR_WIDTH: u16 = 80;
+pub const SIDEBAR_WIDTH_STEP: u16 = 4;
+
+pub fn clamp_sidebar_width(width: u16) -> u16 {
+    width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+}
+
+pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
+    let width = clamp_sidebar_width(width);
+    if wider {
+        (width + SIDEBAR_WIDTH_STEP).min(MAX_SIDEBAR_WIDTH)
+    } else {
+        width.saturating_sub(SIDEBAR_WIDTH_STEP).max(MIN_SIDEBAR_WIDTH)
+    }
+}
 
 /// Shell-agnostic command name typed into panes we create. [`spawn_env`]
 /// prepends this binary's directory to PATH, so PowerShell, cmd, sh, bash,
@@ -144,6 +163,10 @@ pub struct State {
     /// Dock the sidebar at the right edge of each tab. False preserves the
     /// historical left dock.
     pub dock_right: bool,
+    /// Preferred pane width in terminal columns. Layout code keeps this
+    /// column target in the normal range and yields proportionally when the
+    /// tab becomes unusually narrow.
+    pub sidebar_width: u16,
 }
 
 impl Default for State {
@@ -158,6 +181,7 @@ impl Default for State {
             follow_cwd: true,
             git_deco: true,
             dock_right: false,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
         }
     }
 }
@@ -294,7 +318,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
@@ -302,7 +326,8 @@ fn write_state(path: &Path, state: State) {
         state.auto_open,
         state.follow_cwd,
         state.git_deco,
-        state.dock_right
+        state.dock_right,
+        clamp_sidebar_width(state.sidebar_width)
     );
     let _ = std::fs::write(path, json);
 }
@@ -677,6 +702,12 @@ pub fn parse_state(json: &str) -> State {
             .get("dock_right")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.dock_right),
+        sidebar_width: value
+            .get("sidebar_width")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .map(clamp_sidebar_width)
+            .unwrap_or(default.sidebar_width),
     }
 }
 
@@ -790,8 +821,9 @@ mod tests {
             follow_cwd: false,
             git_deco: false,
             dock_right: true,
+            sidebar_width: 44,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -802,8 +834,21 @@ mod tests {
         assert!(parse_state("{\"merged\":true}").git_deco);
         // Files written before the dock setting existed stay left-docked.
         assert!(!parse_state("{\"merged\":true}").dock_right);
+        assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
+        assert_eq!(parse_state("{\"sidebar_width\":1}").sidebar_width, 24);
+        assert_eq!(parse_state("{\"sidebar_width\":999}").sidebar_width, 80);
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
+    }
+
+    #[test]
+    fn sidebar_width_steps_and_saturates_within_supported_bounds() {
+        assert_eq!(step_sidebar_width(32, true), 36);
+        assert_eq!(step_sidebar_width(32, false), 28);
+        assert_eq!(step_sidebar_width(MAX_SIDEBAR_WIDTH, true), MAX_SIDEBAR_WIDTH);
+        assert_eq!(step_sidebar_width(MIN_SIDEBAR_WIDTH, false), MIN_SIDEBAR_WIDTH);
+        assert_eq!(step_sidebar_width(1, true), 28);
+        assert_eq!(step_sidebar_width(u16::MAX, false), 76);
     }
 
     #[test]

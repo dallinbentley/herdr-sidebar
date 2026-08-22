@@ -410,6 +410,7 @@ enum Overlay {
 enum Setting {
     UnifiedSidebar,
     DockRight,
+    SidebarWidth,
     IconTheme,
     AutoOpen,
     FollowCwd,
@@ -493,6 +494,41 @@ impl PaneCtl {
         );
     }
 
+    fn resize_preferred(&self, current: u16, target: u16, dock_right: bool) {
+        let Ok(layout) = herdr_sidebar::ipc::call_text(
+            "pane.layout",
+            serde_json::json!({ "pane_id": self.pane_id }),
+        ) else {
+            return;
+        };
+        let Some(step) = herdr_sidebar::launch::preferred_resize_plan(
+            &layout,
+            &self.pane_id,
+            current,
+            target,
+            dock_right,
+        ) else {
+            return;
+        };
+        let _ = herdr_sidebar::ipc::call_text(
+            "pane.resize",
+            serde_json::json!({
+                "pane_id": self.pane_id,
+                "direction": step.direction,
+                "amount": step.amount,
+            }),
+        );
+    }
+
+    fn layout_width(&self) -> Option<i64> {
+        let layout = herdr_sidebar::ipc::call_text(
+            "pane.layout",
+            serde_json::json!({ "pane_id": self.pane_id }),
+        )
+        .ok()?;
+        herdr_sidebar::launch::layout_width(&layout)
+    }
+
     /// Report identity tokens: always our own; in merged mode also the other
     /// view's (one Sidebar pane satisfies both plugins' launchers), otherwise
     /// clear the other view's token.
@@ -550,6 +586,9 @@ pub struct App {
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     page: usize,
     last_width: u16,
+    /// Whole tab area width from the last layout snapshot. Divider-only
+    /// resizes leave this unchanged and are therefore respected.
+    last_layout_width: Option<i64>,
     last_height: u16,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
@@ -592,6 +631,7 @@ impl App {
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
         let pane_ctl = PaneCtl::from_env();
+        let last_layout_width = pane_ctl.as_ref().and_then(PaneCtl::layout_width);
 
         // Mirror the SCM view the user was already looking at: a sidebar docked
         // into a brand-new preview tab starts with the same drawers expanded,
@@ -642,7 +682,8 @@ impl App {
             last_click: None,
             last_preview: None,
             page: 20,
-            last_width: 40,
+            last_width: sidebar_state.sidebar_width,
+            last_layout_width,
             last_height: 24,
             sidebar_state,
             other_exe,
@@ -784,7 +825,15 @@ impl App {
     /// Periodic timer tick: retry repo discovery if we started outside one,
     /// pick up external changes, and collect finished ✧ suggestion / sync runs.
     pub fn tick(&mut self) {
-        self.sidebar_state.git_deco = sidebar::load_state().git_deco;
+        let shared = sidebar::load_state();
+        self.sidebar_state.git_deco = shared.git_deco;
+        self.sidebar_state.dock_right = shared.dock_right;
+        if shared.sidebar_width != self.sidebar_state.sidebar_width {
+            self.sidebar_state.sidebar_width = shared.sidebar_width;
+            if let Some(ctl) = &self.pane_ctl {
+                ctl.resize_preferred(self.last_width, shared.sidebar_width, shared.dock_right);
+            }
+        }
         if let Some(rx) = &self.suggesting {
             match rx.try_recv() {
                 Ok(message) => {
@@ -833,6 +882,25 @@ impl App {
             }
         }
         self.refresh();
+    }
+
+    pub fn on_resize(&mut self, width: u16) {
+        self.last_width = width;
+        if let Some(ctl) = &self.pane_ctl {
+            let layout_width = ctl.layout_width();
+            let surrounding_changed = self
+                .last_layout_width
+                .zip(layout_width)
+                .is_some_and(|(before, now)| before != now);
+            self.last_layout_width = layout_width.or(self.last_layout_width);
+            if surrounding_changed {
+                ctl.resize_preferred(
+                    width,
+                    self.sidebar_state.sidebar_width,
+                    self.sidebar_state.dock_right,
+                );
+            }
+        }
     }
 
     /// The title bar's Collapse All: fold every repo section and drawer. The
@@ -1447,10 +1515,12 @@ impl App {
             Close,
             Activate,
             ToggleSetting(usize),
+            AdjustWidth(bool),
             DiscardConfirmed(usize, FileEntry),
             GitConfirmed(usize, Vec<String>),
         }
-        let row_count = self.settings_rows().len();
+        let settings = self.settings_rows();
+        let row_count = settings.len();
         let cmd = match self.overlay.as_mut() {
             Some(Overlay::Menu {
                 entries, selected, ..
@@ -1477,6 +1547,18 @@ impl App {
                     *selected = (*selected + 1).min(row_count.saturating_sub(1));
                     Cmd::Nothing
                 }
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| row.0)
+                        == Some(Setting::SidebarWidth) =>
+                {
+                    Cmd::AdjustWidth(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| row.0)
+                        == Some(Setting::SidebarWidth) =>
+                {
+                    Cmd::AdjustWidth(true)
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
             },
@@ -1497,6 +1579,7 @@ impl App {
             Cmd::Close => self.overlay = None,
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
+            Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
             Cmd::GitConfirmed(repo, args) => {
                 self.overlay = None;
                 let strs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1640,6 +1723,12 @@ impl App {
                 true,
             ),
             (
+                Setting::SidebarWidth,
+                "Sidebar width",
+                format!("{} cols", self.sidebar_state.sidebar_width),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -1718,6 +1807,7 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
+            Setting::SidebarWidth => self.adjust_sidebar_width(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::Hotkeys => {
                 self.sidebar_state =
@@ -1740,6 +1830,19 @@ impl App {
                 self.overlay = None;
                 self.change_folder_dialog();
             }
+        }
+    }
+
+    fn adjust_sidebar_width(&mut self, wider: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.sidebar_width = sidebar::step_sidebar_width(state.sidebar_width, wider);
+        });
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.resize_preferred(
+                self.last_width,
+                self.sidebar_state.sidebar_width,
+                self.sidebar_state.dock_right,
+            );
         }
     }
 
@@ -1837,7 +1940,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ toggle · esc close".dim()));
+        lines.push(Line::from(" click/⏎ toggle · ←/→ width · esc close".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
