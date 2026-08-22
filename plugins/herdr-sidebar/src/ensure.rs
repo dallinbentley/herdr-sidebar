@@ -13,22 +13,31 @@ use crate::{ipc, launch};
 struct Lock(PathBuf);
 
 impl Lock {
-    fn acquire() -> Option<Self> {
+    fn acquire(wait: bool) -> Option<Self> {
         let dir = std::env::temp_dir().join("herdr-sidebar-ensure.lock");
-        if std::fs::create_dir(&dir).is_ok() {
-            return Some(Self(dir));
+        let attempts = if wait { 20 } else { 0 };
+        for attempt in 0..=attempts {
+            if std::fs::create_dir(&dir).is_ok() {
+                return Some(Self(dir));
+            }
+            // Break locks older than 30s (a crashed run), otherwise yield or
+            // wait for a discrete action that must not be dropped.
+            let stale = std::fs::metadata(&dir)
+                .and_then(|m| m.created().or_else(|_| m.modified()))
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > 30);
+            if stale {
+                let _ = std::fs::remove_dir_all(&dir);
+                if std::fs::create_dir(&dir).is_ok() {
+                    return Some(Self(dir));
+                }
+            }
+            if attempt < attempts {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
         }
-        // Break locks older than 30s (a crashed run), otherwise yield.
-        let stale = std::fs::metadata(&dir)
-            .and_then(|m| m.created().or_else(|_| m.modified()))
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age.as_secs() > 30);
-        if !stale {
-            return None;
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).ok().map(|_| Self(dir))
+        None
     }
 }
 
@@ -50,7 +59,9 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     if !toggle && !crate::state::load_state().auto_open {
         return Ok(());
     }
-    let Some(_lock) = Lock::acquire() else {
+    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let wait_for_lock = must_wait_for_lock(toggle, &event_json);
+    let Some(_lock) = Lock::acquire(wait_for_lock) else {
         return Ok(());
     };
     let mut panes = ipc::call_text("pane.list", serde_json::json!({}))?;
@@ -62,7 +73,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let scope = if toggle {
         String::new()
     } else {
-        launch::event_scope(&std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default())
+        launch::event_scope(&event_json)
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
     let snooze_dir = snooze::dir();
@@ -127,9 +138,10 @@ fn open(panes_json: &str, focus_new: bool, scope: &str) -> std::io::Result<()> {
         return Ok(());
     };
 
-    let dock_right = crate::state::load_state().dock_right;
+    let state = crate::state::load_state();
+    let dock_right = state.dock_right;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": fid }))?;
-    let plan = launch::open_plan(&layout, dock_right);
+    let plan = launch::open_plan(&layout, dock_right, state.sidebar_width);
     let mut fields = plan.split('\t');
     let target = fields
         .next()
@@ -281,4 +293,16 @@ mod tests {
         assert_eq!(snooze_tab_for_scope(panes, "w2:t1"), "w2:t1");
         assert_eq!(snooze_tab_for_scope(panes, "w2"), "");
     }
+
+    #[test]
+    fn discrete_tab_creation_and_manual_toggles_wait_for_the_lock() {
+        assert!(must_wait_for_lock(false, r#"{"event":"tab_created"}"#));
+        assert!(must_wait_for_lock(false, r#"{"event":"tab.created"}"#));
+        assert!(must_wait_for_lock(true, ""));
+        assert!(!must_wait_for_lock(false, r#"{"event":"tab_focused"}"#));
+    }
+}
+
+fn must_wait_for_lock(toggle: bool, event_json: &str) -> bool {
+    toggle || launch::event_kind(event_json) == "tab_created"
 }

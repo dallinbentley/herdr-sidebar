@@ -18,17 +18,32 @@ bin="$bin_dir/herdr-sidebar"
 # lock so a disabled hook never contends with a user toggle.
 [ "$("$bin" --auto-open 2>/dev/null || echo on)" = "off" ] && exit 0
 
-# Focus events arrive in bursts (tab.focused + workspace.focused for one switch)
-# and concurrent ensures each open an explorer — serialize with an atomic mkdir
-# lock. Losing the race skips this ensure; the next focus event re-fires it.
+# Focus events arrive in bursts and concurrent ensures each open an explorer —
+# serialize with an atomic mkdir lock. Focus events may skip a held lock because
+# another event will follow; tab.created is discrete and must wait or the new
+# preview tab can permanently miss its sidebar (issue #32).
 lock_dir="${TMPDIR:-/tmp}/herdr-sidebar-ensure.lock"
+event_kind="$("$bin" --event-kind 2>/dev/null || true)"
 if ! mkdir "$lock_dir" 2>/dev/null; then
-  # Break locks older than 30s (a crashed ensure), otherwise yield.
+  # Break locks older than 30s (a crashed ensure).
   now="$(date +%s)"
   born="$(stat -c %Y "$lock_dir" 2>/dev/null || stat -f %m "$lock_dir" 2>/dev/null || echo "$now")"
-  [ $((now - born)) -gt 30 ] || exit 0
-  rm -rf "$lock_dir" 2>/dev/null
-  mkdir "$lock_dir" 2>/dev/null || exit 0
+  if [ $((now - born)) -gt 30 ]; then
+    rm -rf "$lock_dir" 2>/dev/null
+    mkdir "$lock_dir" 2>/dev/null || exit 0
+  elif [ "$event_kind" = "tab_created" ]; then
+    acquired="false"
+    for _ in {1..20}; do
+      sleep 0.5
+      if mkdir "$lock_dir" 2>/dev/null; then
+        acquired="true"
+        break
+      fi
+    done
+    [ "$acquired" = "true" ] || exit 0
+  else
+    exit 0
+  fi
 fi
 trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
 

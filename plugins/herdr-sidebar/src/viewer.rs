@@ -947,10 +947,25 @@ fn close_own_pane(control: &Path) {
                 .as_deref()
                 .is_some_and(|json| tab_is_plugin_only(json, &preview.tab_id))
     }) {
-        let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": preview.tab_id }));
+        close_preview_tab(&preview);
     } else {
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
+}
+
+fn close_preview_tab(preview: &PreviewPane) {
+    // Focus first: closing our own tab kills this process, so code after a
+    // successful tab.close is not guaranteed to run.
+    if !preview.origin_tab_id.is_empty() {
+        let _ = ipc::call_text(
+            "tab.focus",
+            serde_json::json!({ "tab_id": preview.origin_tab_id }),
+        );
+    }
+    let _ = ipc::call_text(
+        "tab.close",
+        serde_json::json!({ "tab_id": preview.tab_id }),
+    );
 }
 
 fn pin_own_tab(doc_key: &str) {
@@ -1573,6 +1588,7 @@ pub fn open_in_pane(
 ) -> Result<PreviewTarget, String> {
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
+    let caller_tab_id = crate::launch::tab_of(&list, my_pane_id);
     sweep_orphan_controls(&list);
     // Route only within OUR space. A session-wide search reused another
     // project's ephemeral tab and focus jumped there, which reads as the
@@ -1595,28 +1611,33 @@ pub fn open_in_pane(
     }
     previews.retain(|preview| !preview.stale);
     previews.sort_by(|a, b| a.tab_id.cmp(&b.tab_id).then(a.pane_id.cmp(&b.pane_id)));
+    let origin_tab_id = preview_origin_tab(&previews, &caller_tab_id);
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
+        remember_origin(&p.pane_id, &origin_tab_id);
         let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
             tab_id: p.tab_id,
+            origin_tab_id,
         });
     }
 
     // 2. Overwrite the ephemeral tab.
     if let Some(p) = reusable_preview(&previews) {
         write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
+        remember_origin(&p.pane_id, &origin_tab_id);
         let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
             tab_id: p.tab_id,
+            origin_tab_id,
         });
     }
 
     // 3. Nothing reusable — a tab of its own.
-    spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload)
+    spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
 }
 
 /// Where a preview request landed. Handed back so a double click can pin
@@ -1626,6 +1647,7 @@ pub fn open_in_pane(
 pub struct PreviewTarget {
     pub pane_id: String,
     pub tab_id: String,
+    pub origin_tab_id: String,
 }
 
 /// Mark a preview's tab pinned: wait briefly for a clean viewer to acknowledge
@@ -1677,6 +1699,7 @@ fn spawn_preview_tab(
     spawn_cwd: &Path,
     doc_key: &str,
     payload: &str,
+    origin_tab_id: &str,
 ) -> Result<PreviewTarget, String> {
     let (new_pane, control) = spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload)?;
     let moved = match ipc::call_text(
@@ -1708,6 +1731,7 @@ fn spawn_preview_tab(
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview tab could not record ownership".into());
     }
+    remember_origin(&new_pane, origin_tab_id);
     if !start_viewer_pane(&new_pane) {
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview process failed to start".into());
@@ -1715,7 +1739,22 @@ fn spawn_preview_tab(
     Ok(PreviewTarget {
         pane_id: new_pane,
         tab_id,
+        origin_tab_id: origin_tab_id.to_string(),
     })
+}
+
+fn remember_origin(pane_id: &str, tab_id: &str) {
+    if tab_id.is_empty() {
+        return;
+    }
+    let _ = ipc::call_text(
+        "pane.report_metadata",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "source": METADATA_SOURCE,
+            "tokens": { TOKEN_ORIGIN_TAB: tab_id },
+        }),
+    );
 }
 
 /// Ask this tab's viewer to close (Esc from the sidebar). A live viewer owns
@@ -1733,8 +1772,7 @@ pub fn close_in_tab(my_pane_id: &str) {
                 && (preview.dedicated || preview.resumed)
                 && tab_is_plugin_only(&json, &preview.tab_id)
             {
-                let _ =
-                    ipc::call_text("tab.close", serde_json::json!({ "tab_id": preview.tab_id }));
+                close_preview_tab(&preview);
             } else {
                 let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
             }
@@ -1805,6 +1843,7 @@ pub const TOKEN_PATH: &str = "hs-preview-path";
 pub const TOKEN_PINNED: &str = "hs-preview-pinned";
 pub const TOKEN_CONTROL: &str = "hs-preview-control";
 pub const TOKEN_DEDICATED: &str = "hs-preview-dedicated";
+pub const TOKEN_ORIGIN_TAB: &str = "hs-preview-origin-tab";
 
 /// A live preview pane and the document it is showing. State lives on the
 /// pane, so it cannot outlive what it describes.
@@ -1821,6 +1860,7 @@ pub struct PreviewPane {
     pub control: PathBuf,
     pub stale: bool,
     pub dedicated: bool,
+    pub origin_tab_id: String,
     /// Herdr restored the pane label but not its process metadata. This is a
     /// dead shell left behind by server resume, not a live unsaved editor.
     pub resumed: bool,
@@ -1898,6 +1938,12 @@ fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
                 control,
                 stale,
                 dedicated: p.tokens.contains_key(TOKEN_DEDICATED),
+                origin_tab_id: p
+                    .tokens
+                    .get(TOKEN_ORIGIN_TAB)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 resumed,
             })
         })
@@ -1966,6 +2012,22 @@ fn preview_for_doc(previews: &[PreviewPane], doc_key: &str) -> Option<PreviewPan
 /// The ephemeral tab, if one exists. Pinned tabs are never overwritten.
 fn reusable_preview(previews: &[PreviewPane]) -> Option<PreviewPane> {
     previews.iter().find(|p| !p.stale && !p.pinned).cloned()
+}
+
+/// An ephemeral preview's sidebar is itself a valid launch surface. Preserve
+/// the tab that originally opened it rather than recording the preview tab as
+/// its own return destination. A pinned preview is a normal caller tab.
+fn preview_origin_tab(previews: &[PreviewPane], caller_tab_id: &str) -> String {
+    previews
+        .iter()
+        .find(|preview| {
+            !preview.stale
+                && !preview.pinned
+                && preview.tab_id == caller_tab_id
+                && !preview.origin_tab_id.is_empty()
+        })
+        .map(|preview| preview.origin_tab_id.clone())
+        .unwrap_or_else(|| caller_tab_id.to_string())
 }
 
 /// Split a viewer pane directly to the caller's right: split the right
@@ -2422,7 +2484,7 @@ mod tests {
     const PREVIEWS: &str = r#"{"result":{"panes":[
         {"pane_id":"w4:p1","tab_id":"w4:t1","tokens":{"herdr-sidebar-explorer":"1"}},
         {"pane_id":"w4:p2","tab_id":"w4:t2",
-          "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/a.rs","hs-preview-pinned":"1","hs-preview-dedicated":"1","hs-preview-control":"C:/state/a preview.ctl"}},
+          "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/a.rs","hs-preview-pinned":"1","hs-preview-dedicated":"1","hs-preview-origin-tab":"w4:t1","hs-preview-control":"C:/state/a preview.ctl"}},
         {"pane_id":"w4:p3","tab_id":"w4:t3",
           "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/b.rs"}}
     ]}}"#;
@@ -2559,6 +2621,7 @@ mod tests {
         assert!(a.dedicated);
         assert!(!a.resumed);
         assert_eq!(a.tab_id, "w4:t2");
+        assert_eq!(a.origin_tab_id, "w4:t1");
         assert_eq!(a.control, PathBuf::from("C:/state/a preview.ctl"));
         assert!(
             !ps.iter()
@@ -2594,11 +2657,25 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_previews_preserve_the_original_return_tab() {
+        let mut previews = previews_in(PREVIEWS);
+        let ephemeral = previews
+            .iter_mut()
+            .find(|preview| !preview.pinned)
+            .unwrap();
+        ephemeral.origin_tab_id = "w4:t1".into();
+        assert_eq!(preview_origin_tab(&previews, "w4:t3"), "w4:t1");
+        assert_eq!(preview_origin_tab(&previews, "w4:t2"), "w4:t2");
+        assert_eq!(preview_origin_tab(&previews, "w4:t9"), "w4:t9");
+    }
+
+    #[test]
     fn pinning_requires_the_viewer_to_acknowledge_that_document() {
         let previews = previews_in(PREVIEWS);
         let target = PreviewTarget {
             pane_id: "w4:p3".into(),
             tab_id: "w4:t3".into(),
+            origin_tab_id: "w4:t1".into(),
         };
         assert!(target_is_showing(&previews, &target, "/r/b.rs"));
         assert!(!target_is_showing(&previews, &target, "/r/other.rs"));

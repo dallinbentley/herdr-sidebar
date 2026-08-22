@@ -21,8 +21,8 @@ pub const PANE_LABEL: &str = "Explorer";
 /// Explorer independently of the (cosmetic, clearable) label.
 pub const METADATA_SOURCE: &str = "herdr-sidebar-explorer";
 
-/// Preferred explorer width in columns; the ratio is derived from the target pane.
-const TARGET_COLS: f64 = 32.0;
+const MIN_SIDEBAR_SHARE: f64 = 0.15;
+const MAX_SIDEBAR_SHARE: f64 = 0.5;
 
 #[derive(Deserialize)]
 struct PaneListMsg {
@@ -414,7 +414,7 @@ fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
 /// `<pane_id>\t<ratio>\t<swap>` for the configured edge. Left docking splits
 /// the leftmost pane and swaps; right docking splits the rightmost pane with
 /// an inverted original-pane ratio and needs no swap. Empty on any failure.
-pub fn open_plan(layout_json: &str, dock_right: bool) -> String {
+pub fn open_plan(layout_json: &str, dock_right: bool, target_cols: u16) -> String {
     let Ok(msg) = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)) else {
         return String::new();
     };
@@ -441,9 +441,17 @@ pub fn open_plan(layout_json: &str, dock_right: bool) -> String {
     let Some((id, rect)) = best else {
         return String::new();
     };
-    let sidebar_share = (TARGET_COLS / rect.width as f64).clamp(0.15, 0.5);
+    let sidebar_share =
+        (f64::from(target_cols) / rect.width as f64).clamp(MIN_SIDEBAR_SHARE, MAX_SIDEBAR_SHARE);
     let ratio = if dock_right { 1.0 - sidebar_share } else { sidebar_share };
-    format!("{id}\t{ratio:.2}\t{}", !dock_right)
+    format!("{id}\t{ratio:.6}\t{}", !dock_right)
+}
+
+/// Width of the whole tab area that owns a pane split. A pane-only divider
+/// resize leaves this unchanged; terminal chrome/sidebar changes do not.
+pub fn layout_width(layout_json: &str) -> Option<i64> {
+    let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
+    msg.result.layout.area.map(|area| area.width)
 }
 
 /// The tab (preferred) or workspace the event concerns, from
@@ -507,8 +515,9 @@ pub fn focused_pane_in(pane_list_json: &str, scope: &str) -> String {
 ///
 /// All five hooks run the SAME script, so the payload is the only way to
 /// treat space creation differently from an ordinary focus. The envelope
-/// shape is undocumented, so the discriminator is looked for at the top level
-/// and under the usual wrappers.
+/// `EventEnvelope` currently serializes the discriminator as lower_snake in
+/// `event`, while manifest hook names use dotted form. Both are accepted, and
+/// the usual nested wrappers remain supported for older payload shapes.
 ///
 /// The result is interpolated into a shell command, so it is restricted to a
 /// plain `lower_snake` identifier; anything else yields "".
@@ -524,10 +533,11 @@ pub fn event_kind(event_json: &str) -> String {
             None => None,
         })
         .unwrap_or_default();
+    let kind = kind.replace('.', "_");
     let safe = !kind.is_empty()
         && kind.chars().all(|c| c.is_ascii_lowercase() || c == '_')
         && kind.len() <= 64;
-    if safe { kind.to_string() } else { String::new() }
+    if safe { kind } else { String::new() }
 }
 
 /// A workspace's label from a `workspace list` JSON, empty when unknown.
@@ -720,6 +730,44 @@ pub fn resize_plan(
     term_cols_target: u16,
     dock_right: bool,
 ) -> Option<ResizeStep> {
+    resize_plan_inner(
+        layout_json,
+        pane_id,
+        term_cols_now,
+        term_cols_target,
+        dock_right,
+        false,
+    )
+}
+
+/// Re-assert a preferred column width after the tab's available width changes.
+/// The target is exact in the normal range, but yields to the same 15%-50%
+/// share bounds used when the sidebar first spawns.
+pub fn preferred_resize_plan(
+    layout_json: &str,
+    pane_id: &str,
+    term_cols_now: u16,
+    preferred_cols: u16,
+    dock_right: bool,
+) -> Option<ResizeStep> {
+    resize_plan_inner(
+        layout_json,
+        pane_id,
+        term_cols_now,
+        preferred_cols,
+        dock_right,
+        true,
+    )
+}
+
+fn resize_plan_inner(
+    layout_json: &str,
+    pane_id: &str,
+    term_cols_now: u16,
+    term_cols_target: u16,
+    dock_right: bool,
+    clamp_share: bool,
+) -> Option<ResizeStep> {
     let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
     let layout = &msg.result.layout;
     let pane_rect = layout
@@ -728,11 +776,6 @@ pub fn resize_plan(
         .find(|p| p.pane_id.as_deref() == Some(pane_id))?
         .rect
         .as_ref()?;
-    // The pane rect can be a couple of columns wider than the terminal inside
-    // it (pane chrome); express the target in rect space.
-    let chrome = pane_rect.width - i64::from(term_cols_now);
-    let target_rect_w = i64::from(term_cols_target) + chrome.max(0);
-
     let divider_x = if dock_right { pane_rect.x } else { pane_rect.x + pane_rect.width };
     let split = layout
         .splits
@@ -744,6 +787,19 @@ pub fn resize_plan(
             rect.x <= pane_rect.x && (split_divider - divider_x).abs() <= 2 && rect.width > 0
         })
         .min_by_key(|(rect, _)| rect.width)?;
+
+    // The pane rect can be a couple of columns wider than the terminal inside
+    // it (pane chrome); express the target in rect space. Preferred-width
+    // reassertion keeps the content usable at extreme tab widths.
+    let chrome = pane_rect.width - i64::from(term_cols_now);
+    let requested = i64::from(term_cols_target) + chrome.max(0);
+    let target_rect_w = if clamp_share {
+        let min = (split.0.width as f64 * MIN_SIDEBAR_SHARE).ceil() as i64;
+        let max = (split.0.width as f64 * MAX_SIDEBAR_SHARE).floor() as i64;
+        requested.clamp(min, max.max(min))
+    } else {
+        requested
+    };
 
     let delta = (target_rect_w - pane_rect.width) as f64 / split.0.width as f64;
     if delta.abs() < 0.005 {
@@ -860,6 +916,7 @@ mod tests {
             event_kind(r#"{"event":{"type":"tab_focused"}}"#),
             "tab_focused"
         );
+        assert_eq!(event_kind(r#"{"event":"tab.created"}"#), "tab_created");
     }
 
     /// The kind is interpolated into a shell command, so anything that is not
@@ -1083,7 +1140,7 @@ mod tests {
             "\u{feff}{}",
             layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":90,"height":50}}"#)
         );
-        assert_eq!(open_plan(&layout_json, false), "w1:p1\t0.36\ttrue");
+        assert_eq!(open_plan(&layout_json, false, 32), "w1:p1\t0.355556\ttrue");
     }
 
     #[test]
@@ -1107,10 +1164,10 @@ mod tests {
                {"pane_id":"w1:p3","rect":{"x":29,"y":36,"width":90,"height":35}},
                {"pane_id":"w1:p1","rect":{"x":29,"y":1,"width":90,"height":35}}"#,
         );
-        let plan = open_plan(&json, false);
+        let plan = open_plan(&json, false, 32);
         let (id, ratio) = plan.split_once('\t').unwrap();
         assert_eq!(id, "w1:p1");
-        assert_eq!(ratio, "0.36\ttrue"); // 32 / 90, then swap left
+        assert_eq!(ratio, "0.355556\ttrue"); // 32 / 90, then swap left
     }
 
     #[test]
@@ -1120,17 +1177,25 @@ mod tests {
                {"pane_id":"w1:p3","rect":{"x":29,"y":1,"width":90,"height":70}},
                {"pane_id":"w1:p1","rect":{"x":119,"y":1,"width":90,"height":35}}"#,
         );
-        assert_eq!(open_plan(&json, true), "w1:p1\t0.64\tfalse");
+        assert_eq!(open_plan(&json, true, 32), "w1:p1\t0.644444\tfalse");
     }
 
     #[test]
     fn open_plan_clamps_ratio() {
         let wide = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":400,"height":50}}"#);
-        assert_eq!(open_plan(&wide, false), "w1:p1\t0.15\ttrue");
-        assert_eq!(open_plan(&wide, true), "w1:p1\t0.85\tfalse");
+        assert_eq!(open_plan(&wide, false, 32), "w1:p1\t0.150000\ttrue");
+        assert_eq!(open_plan(&wide, true, 32), "w1:p1\t0.850000\tfalse");
         let narrow = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":40,"height":50}}"#);
-        assert_eq!(open_plan(&narrow, false), "w1:p1\t0.50\ttrue");
-        assert_eq!(open_plan(&narrow, true), "w1:p1\t0.50\tfalse");
+        assert_eq!(open_plan(&narrow, false, 32), "w1:p1\t0.500000\ttrue");
+        assert_eq!(open_plan(&narrow, true, 32), "w1:p1\t0.500000\tfalse");
+        assert_eq!(open_plan(&narrow, false, 24), "w1:p1\t0.500000\ttrue");
+    }
+
+    #[test]
+    fn layout_width_distinguishes_tab_area_from_pane_width() {
+        let json = r#"{"result":{"layout":{"area":{"x":0,"y":0,"width":174,"height":50},"panes":[{"pane_id":"e","rect":{"x":0,"y":0,"width":42,"height":50}}]}}}"#;
+        assert_eq!(layout_width(json), Some(174));
+        assert_eq!(layout_width("not json"), None);
     }
 
     #[test]
@@ -1239,6 +1304,25 @@ mod tests {
     }
 
     #[test]
+    fn preferred_resize_plan_pins_columns_but_yields_at_extremes() {
+        let normal = layout_with_splits(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":39,"height":50}}"#,
+            r#"{"direction":"right","ratio":0.195,"rect":{"x":0,"y":0,"width":200,"height":50}}"#,
+        );
+        let step = preferred_resize_plan(&normal, "e", 37, 42, false).unwrap();
+        assert_eq!(step.direction, "right");
+        assert!((step.amount - 5.0 / 200.0).abs() < 1e-9);
+
+        let narrow = layout_with_splits(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":20,"height":50}}"#,
+            r#"{"direction":"right","ratio":0.333333,"rect":{"x":0,"y":0,"width":60,"height":50}}"#,
+        );
+        let step = preferred_resize_plan(&narrow, "e", 18, 42, false).unwrap();
+        assert_eq!(step.direction, "right");
+        assert!((step.amount - 10.0 / 60.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn resize_plan_picks_innermost_matching_split() {
         // Nested: root split (divider elsewhere) plus the inner split whose
         // divider is at the explorer's right edge.
@@ -1268,9 +1352,9 @@ mod tests {
 
     #[test]
     fn open_plan_is_empty_on_failure() {
-        assert_eq!(open_plan("not json", false), "");
-        assert_eq!(open_plan(&layout(""), false), "");
+        assert_eq!(open_plan("not json", false, 32), "");
+        assert_eq!(open_plan(&layout(""), false, 32), "");
         let unsafe_id = layout(r#"{"pane_id":"--x","rect":{"x":0,"y":0,"width":90,"height":50}}"#);
-        assert_eq!(open_plan(&unsafe_id, true), "");
+        assert_eq!(open_plan(&unsafe_id, true, 32), "");
     }
 }

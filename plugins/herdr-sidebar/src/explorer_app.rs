@@ -28,9 +28,6 @@ use herdr_sidebar::state::Exit;
 
 const MY_VIEW: View = View::Explorer;
 
-/// Expanded width to restore when nothing better is known.
-const DEFAULT_EXPANDED_WIDTH: u16 = 32;
-
 /// How often the git status decorations are re-read while the view is idle
 /// (issue #19's "live update"). Two cheap `git status` calls per repo; the
 /// explorer's own poll is 500ms, so this throttles them down to a quarter of
@@ -91,6 +88,41 @@ impl PaneCtl {
             }),
         );
     }
+
+    fn resize_preferred(&self, current: u16, target: u16, dock_right: bool) {
+        let Ok(layout) = herdr_sidebar::ipc::call_text(
+            "pane.layout",
+            serde_json::json!({ "pane_id": self.pane_id }),
+        ) else {
+            return;
+        };
+        let Some(step) = herdr_sidebar::launch::preferred_resize_plan(
+            &layout,
+            &self.pane_id,
+            current,
+            target,
+            dock_right,
+        ) else {
+            return;
+        };
+        let _ = herdr_sidebar::ipc::call_text(
+            "pane.resize",
+            serde_json::json!({
+                "pane_id": self.pane_id,
+                "direction": step.direction,
+                "amount": step.amount,
+            }),
+        );
+    }
+
+    fn layout_width(&self) -> Option<i64> {
+        let layout = herdr_sidebar::ipc::call_text(
+            "pane.layout",
+            serde_json::json!({ "pane_id": self.pane_id }),
+        )
+        .ok()?;
+        herdr_sidebar::launch::layout_width(&layout)
+    }
 }
 
 /// Where the tree body was drawn last frame, for mouse hit-testing.
@@ -147,6 +179,7 @@ enum Overlay {
 enum Setting {
     UnifiedSidebar,
     DockRight,
+    SidebarWidth,
     IconTheme,
     AutoOpen,
     FollowCwd,
@@ -176,6 +209,9 @@ pub struct App {
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
     /// strides are based on what was actually rendered.
     last_width: u16,
+    /// Whole tab area width from the last layout snapshot. A divider drag
+    /// changes only this pane; surrounding terminal chrome changes this too.
+    last_layout_width: Option<i64>,
     last_height: u16,
     page: usize,
     /// Row index under the mouse cursor, for the hover highlight.
@@ -271,6 +307,7 @@ impl App {
             sidebar::load_state().icons,
         );
         let pane_ctl = PaneCtl::from_env();
+        let last_layout_width = pane_ctl.as_ref().and_then(PaneCtl::layout_width);
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
@@ -287,7 +324,8 @@ impl App {
             snap: restored_selection.is_some(),
             theme,
             pane_ctl,
-            last_width: DEFAULT_EXPANDED_WIDTH,
+            last_width: sidebar_state.sidebar_width,
+            last_layout_width,
             last_height: 24,
             page: 20,
             hovered: None,
@@ -325,7 +363,7 @@ impl App {
     /// the sidebar (an agent editing files, a commit in another pane) show up
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
-        self.sync_git_decorations_setting();
+        self.sync_shared_settings();
         self.collect_decorations();
         if self.last_deco.elapsed() < DECO_REFRESH {
             return;
@@ -336,8 +374,16 @@ impl App {
     /// A separated Source Control pane can change this shared setting while
     /// the Explorer keeps running. Re-read just this field so the tree reacts
     /// without adopting unrelated process-local mode changes.
-    fn sync_git_decorations_setting(&mut self) {
-        let enabled = sidebar::load_state().git_deco;
+    fn sync_shared_settings(&mut self) {
+        let shared = sidebar::load_state();
+        self.sidebar_state.dock_right = shared.dock_right;
+        if shared.sidebar_width != self.sidebar_state.sidebar_width {
+            self.sidebar_state.sidebar_width = shared.sidebar_width;
+            if let Some(ctl) = &self.pane_ctl {
+                ctl.resize_preferred(self.last_width, shared.sidebar_width, shared.dock_right);
+            }
+        }
+        let enabled = shared.git_deco;
         if enabled == self.sidebar_state.git_deco {
             return;
         }
@@ -345,6 +391,25 @@ impl App {
         self.rediscover_repos();
         if !enabled {
             self.deco = Decorations::empty();
+        }
+    }
+
+    pub fn on_resize(&mut self, width: u16) {
+        self.last_width = width;
+        if let Some(ctl) = &self.pane_ctl {
+            let layout_width = ctl.layout_width();
+            let surrounding_changed = self
+                .last_layout_width
+                .zip(layout_width)
+                .is_some_and(|(before, now)| before != now);
+            self.last_layout_width = layout_width.or(self.last_layout_width);
+            if surrounding_changed {
+                ctl.resize_preferred(
+                    width,
+                    self.sidebar_state.sidebar_width,
+                    self.sidebar_state.dock_right,
+                );
+            }
         }
     }
 
@@ -837,9 +902,11 @@ impl App {
             Activate,
             ConfirmPrompt,
             ToggleSetting(usize),
+            AdjustWidth(bool),
             DeleteConfirmed(PathBuf, bool),
         }
-        let row_count = self.settings_rows().len();
+        let settings = self.settings_rows();
+        let row_count = settings.len();
         let cmd = match self.overlay.as_mut() {
             Some(Overlay::Settings { selected, .. }) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => Cmd::Close,
@@ -850,6 +917,18 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *selected = (*selected + 1).min(row_count.saturating_sub(1));
                     Cmd::Nothing
+                }
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| row.0)
+                        == Some(Setting::SidebarWidth) =>
+                {
+                    Cmd::AdjustWidth(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| row.0)
+                        == Some(Setting::SidebarWidth) =>
+                {
+                    Cmd::AdjustWidth(true)
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
@@ -896,6 +975,7 @@ impl App {
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ConfirmPrompt => self.confirm_prompt(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
+            Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
             Cmd::DeleteConfirmed(path, is_dir) => {
                 self.overlay = None;
                 match actions::delete(&path, is_dir) {
@@ -1035,6 +1115,12 @@ impl App {
                 true,
             ),
             (
+                Setting::SidebarWidth,
+                "Sidebar width",
+                format!("{} cols", self.sidebar_state.sidebar_width),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -1121,6 +1207,7 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
+            Setting::SidebarWidth => self.adjust_sidebar_width(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;
@@ -1152,16 +1239,35 @@ impl App {
         }
     }
 
+    fn adjust_sidebar_width(&mut self, wider: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.sidebar_width = sidebar::step_sidebar_width(state.sidebar_width, wider);
+        });
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.resize_preferred(
+                self.last_width,
+                self.sidebar_state.sidebar_width,
+                self.sidebar_state.dock_right,
+            );
+        }
+    }
+
     /// Render the centered Settings popup and remember its rect for clicks.
     fn draw_settings(&mut self, frame: &mut Frame) {
         let rows = self.settings_rows();
+        let area = frame.area();
+        let desired_width = rows
+            .iter()
+            .map(|(_, label, value, _)| label.chars().count() + value.chars().count() + 5)
+            .max()
+            .unwrap_or(30)
+            .max(30) as u16;
+        let width = desired_width.min(area.width);
         // The hotkey reference lives here now; the footer chips are opt-in.
-        let hint_lines = wrap_hints(&self.hints(), 28, 0);
+        let hint_lines = wrap_hints(&self.hints(), width.saturating_sub(2), 0);
         let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
             return;
         };
-        let area = frame.area();
-        let width = 30.min(area.width);
         let height = (rows.len() as u16 + 5 + hint_lines.len() as u16).min(area.height);
         let popup = Rect::new(
             (area.width.saturating_sub(width)) / 2,
@@ -1193,7 +1299,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ toggle · esc close".dim()));
+        lines.push(Line::from(" click/⏎ · ←/→ width · esc".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
