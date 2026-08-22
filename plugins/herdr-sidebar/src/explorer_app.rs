@@ -1255,13 +1255,19 @@ impl App {
     /// Render the centered Settings popup and remember its rect for clicks.
     fn draw_settings(&mut self, frame: &mut Frame) {
         let rows = self.settings_rows();
+        let area = frame.area();
+        let desired_width = rows
+            .iter()
+            .map(|(_, label, value, _)| label.chars().count() + value.chars().count() + 5)
+            .max()
+            .unwrap_or(30)
+            .max(30) as u16;
+        let width = desired_width.min(area.width);
         // The hotkey reference lives here now; the footer chips are opt-in.
-        let hint_lines = wrap_hints(&self.hints(), 28, 0);
+        let hint_lines = wrap_hints(&self.hints(), width.saturating_sub(2), 0);
         let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
             return;
         };
-        let area = frame.area();
-        let width = 30.min(area.width);
         let height = (rows.len() as u16 + 5 + hint_lines.len() as u16).min(area.height);
         let popup = Rect::new(
             (area.width.saturating_sub(width)) / 2,
