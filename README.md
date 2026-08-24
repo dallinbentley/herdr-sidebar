@@ -90,6 +90,9 @@ A real tree, not a directory dump:
 - Dotfiles toggle, live refresh, and a hide command when you want the columns back.
 - Prefer the sidebar closed? Toggle "Auto-open sidebar" off in ⚙ Settings and it stays
   closed until you invoke the open-sidebar action yourself.
+- Want one key to mean open/close? "Strict toggle" in ⚙ Settings closes an open sidebar
+  even when it isn't focused, and "Focus on open" off docks it in the background so
+  focus stays in the pane you toggled from.
 - Prefer the tree on the other side? Toggle "Dock on the right" in ⚙ Settings; the choice
   persists for every future launch and auto-docked tab.
 - Prefer a different width? Adjust "Sidebar width" with `←`/`→` in ⚙ Settings. The column

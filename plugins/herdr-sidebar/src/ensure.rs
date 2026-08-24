@@ -53,10 +53,11 @@ use crate::snooze;
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
 pub fn run(toggle: bool) -> std::io::Result<()> {
+    let state = crate::state::load_state();
     // Auto-open off (⚙ Settings): hooks leave closed tabs alone; the user's
     // explicit toggle still works. The unix hook script makes the same check
     // via `herdr-sidebar --auto-open`.
-    if !toggle && !crate::state::load_state().auto_open {
+    if !toggle && !state.auto_open {
         return Ok(());
     }
     let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
@@ -82,7 +83,15 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     match launch::launch_decision_in(&panes, now, &scope).split_once(' ') {
         Some(("FOCUS", id)) => {
             if toggle {
-                focus(id)?;
+                if state.strict_toggle {
+                    // Strict toggle (⚙ Settings): one press opens, the next
+                    // press closes, wherever focus is. The unix launchers get
+                    // the same mapping from the --launch-decision CLI mode.
+                    ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
+                    snooze::set(&snooze_dir, &tab);
+                } else {
+                    focus(id)?;
+                }
             }
         }
         Some(("CLOSE", id)) => {
@@ -99,12 +108,14 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
             // id. Re-plan from a fresh snapshot rather than splitting a pane
             // that no longer exists.
             panes = ipc::call_text("pane.list", serde_json::json!({}))?;
-            open(&panes, toggle, &scope)?;
+            open(&panes, toggle && state.focus_on_open, &scope)?;
         }
         _ => {
             if toggle {
                 snooze::clear(&snooze_dir, &tab);
-                open(&panes, true, &scope)?;
+                // "Focus on open: off" (⚙ Settings) docks in the background:
+                // open()'s quiet path already hands focus back after the swap.
+                open(&panes, state.focus_on_open, &scope)?;
             } else if !snooze::is_set(&snooze_dir, &tab) {
                 open(&panes, false, &scope)?;
             }

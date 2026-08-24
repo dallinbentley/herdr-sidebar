@@ -182,6 +182,8 @@ enum Setting {
     SidebarWidth,
     IconTheme,
     AutoOpen,
+    StrictToggle,
+    FocusOnOpen,
     FollowCwd,
     HiddenFiles,
     Hotkeys,
@@ -1164,6 +1166,28 @@ impl App {
                 true,
             ),
             (
+                Setting::StrictToggle,
+                "Strict toggle",
+                if self.sidebar_state.strict_toggle {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
+                Setting::FocusOnOpen,
+                "Focus on open",
+                if self.sidebar_state.focus_on_open {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::FollowCwd,
                 "Follow pane folder",
                 sidebar::follow_cwd_setting_value(self.sidebar_state.follow_cwd),
@@ -1220,6 +1244,14 @@ impl App {
             Setting::AutoOpen => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_open = !state.auto_open);
+            }
+            Setting::StrictToggle => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.strict_toggle = !state.strict_toggle);
+            }
+            Setting::FocusOnOpen => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.focus_on_open = !state.focus_on_open);
             }
             Setting::FollowCwd => {
                 self.sidebar_state =
