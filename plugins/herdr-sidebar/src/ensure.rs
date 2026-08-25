@@ -87,7 +87,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
                     // Strict toggle (⚙ Settings): one press opens, the next
                     // press closes, wherever focus is. The unix launchers get
                     // the same mapping from the --launch-decision CLI mode.
-                    ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
+                    graceful_close(id);
                     snooze::set(&snooze_dir, &tab);
                 } else {
                     focus(id)?;
@@ -96,7 +96,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
         }
         Some(("CLOSE", id)) => {
             if toggle {
-                ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
+                graceful_close(id);
                 snooze::set(&snooze_dir, &tab);
             }
         }
@@ -122,6 +122,36 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn graceful_close(pane_id: &str) {
+    let _ = ipc::call_text(
+        "pane.send_input",
+        serde_json::json!({ "pane_id": pane_id, "text": "", "keys": ["ctrl+q"] }),
+    );
+    let mut acknowledged = false;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({}))
+            && !launch::pane_has_token(&json, pane_id)
+        {
+            acknowledged = true;
+            break;
+        }
+    }
+    if acknowledged {
+        let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+    } else {
+        let _ = ipc::call_text(
+            "notification.show",
+            serde_json::json!({
+                "title": "Sidebar close cancelled",
+                "body": "The pane did not acknowledge a safe shutdown; try again shortly.",
+                "position": "bottom-right",
+                "sound": "none",
+            }),
+        );
+    }
 }
 
 fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {

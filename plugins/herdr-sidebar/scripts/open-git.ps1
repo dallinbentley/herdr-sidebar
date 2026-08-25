@@ -39,26 +39,86 @@ if (-not (Test-Path $Bin)) {
     exit 1
 }
 
+# Serialize with the ensure hook and Unix launchers. Without this, a focus
+# event can classify the pane between rename and its first identity token as a
+# corpse and replace it while this explicit toggle is still running.
+$LockDir = Join-Path ([IO.Path]::GetTempPath()) 'herdr-sidebar-ensure.lock'
+$Locked = $false
+for ($i = 0; $i -lt 20; $i++) {
+    try {
+        New-Item -ItemType Directory -Path $LockDir -ErrorAction Stop | Out-Null
+        $Locked = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 500
+    }
+}
+if (-not $Locked) {
+    $lock = Get-Item -LiteralPath $LockDir -ErrorAction SilentlyContinue
+    if ($lock -and ((Get-Date) - $lock.LastWriteTime).TotalSeconds -ge 30) {
+        Remove-Item -LiteralPath $LockDir -Force -ErrorAction SilentlyContinue
+        try {
+            New-Item -ItemType Directory -Path $LockDir -ErrorAction Stop | Out-Null
+            $Locked = $true
+        } catch {}
+    }
+}
+if (-not $Locked) { exit 0 }
+
+try {
+
 # Extract the first `pane_id` from a herdr CLI JSON reply.
 function Get-PaneId([string]$json) {
     return ([regex]'"pane_id":"([^"]+)"').Match($json).Groups[1].Value
 }
 
 $PanesJson = (& $HerdrBin pane list | Out-String)
+$FocusOnOpen = ((& $Bin --focus-on-open 2>$null) | Out-String).Trim()
+if (-not $FocusOnOpen) { $FocusOnOpen = 'on' }
+
+function Close-PaneGracefully([string]$PaneId) {
+    & $HerdrBin pane send-keys $PaneId ctrl+q *> $null
+    $Acknowledged = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 100
+        $listed = (& $HerdrBin pane list 2>$null | Out-String)
+        $listedOk = $LASTEXITCODE -eq 0
+        $present = (($listed | & $Bin --pane-has-token $PaneId 2>$null) | Out-String).Trim()
+        $probeOk = $LASTEXITCODE -eq 0
+        if ($listedOk -and $probeOk -and $present -ne 'yes') {
+            $Acknowledged = $true
+            break
+        }
+    }
+    if ($Acknowledged) {
+        & $HerdrBin pane close $PaneId *> $null
+    } else {
+        & $HerdrBin notification show 'Sidebar close cancelled' `
+            --body 'The pane did not acknowledge a safe shutdown; try again shortly.' `
+            --position bottom-right --sound none *> $null
+    }
+}
 
 function Open-Pane {
     # Focused pane = where the user is working; its cwd picks the repository.
     $fp = ($PanesJson | & $Bin --focused-pane).Trim()
     if (-not $fp) {
         # No focused pane known: best-effort plain split beside the current pane.
-        $splitArgs = @('pane', 'split', '--current', '--direction', 'right', '--ratio', '0.75',
+        $splitArgs = @('pane', 'split', '--current', '--direction', 'right', '--ratio', '0.75', '--no-focus',
             '--env', "PATH=$LaunchPath")
         if ($env:HERDR_PLUGIN_STATE_DIR) {
             $splitArgs += @('--env', "HERDR_PLUGIN_STATE_DIR=$env:HERDR_PLUGIN_STATE_DIR")
         }
         $out = (& $HerdrBin @splitArgs | Out-String)
         $np = Get-PaneId $out
-        if ($np) { & $HerdrBin pane run $np 'herdr-sidebar --view git' }
+        if ($np) {
+            & $HerdrBin pane run $np 'herdr-sidebar --view git'
+            & $HerdrBin pane rename $np 'Source Control' *> $null
+            if ($FocusOnOpen -eq 'on') {
+                & $HerdrBin pane zoom $np --on *> $null
+                & $HerdrBin pane zoom $np --off *> $null
+            }
+        }
         exit 0
     }
     $FocusedId, $FocusedCwd = $fp -split "`t", 2
@@ -91,6 +151,11 @@ function Open-Pane {
     # in place. PATH makes the bare launch independent of the pane's shell.
     if ($NeedsSwap) {
         & $HerdrBin pane swap --source-pane $np --target-pane $Target *> $null
+        if ($FocusOnOpen -ne 'on' -and $Target -eq $FocusedId) {
+            # A left-dock swap moves focus with the slot. Restore the pane the
+            # user invoked the toggle from when background-open is enabled.
+            & $HerdrBin pane focus --direction right --pane $np *> $null
+        }
     }
     & $HerdrBin pane run $np 'herdr-sidebar --view git'
     & $HerdrBin pane rename $np 'Source Control' *> $null
@@ -102,9 +167,11 @@ function Open-Pane {
             Where-Object { $_.pane_id -eq $np }).tokens
         if ($tok) { break }
     }
-    # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
-    & $HerdrBin pane zoom $np --on *> $null
-    & $HerdrBin pane zoom $np --off *> $null
+    if ($FocusOnOpen -eq 'on') {
+        # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
+        & $HerdrBin pane zoom $np --on *> $null
+        & $HerdrBin pane zoom $np --off *> $null
+    }
     exit 0
 }
 
@@ -119,8 +186,8 @@ if ($Decision -like 'FOCUS *') {
     exit $LASTEXITCODE
 } elseif ($Decision -like 'CLOSE *') {
     $PaneId = $Decision.Substring(6)
-    & $HerdrBin pane close $PaneId
-    exit $LASTEXITCODE
+    Close-PaneGracefully $PaneId
+    exit 0
 } elseif ($Decision -like 'REPLACE *') {
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
     $PaneId = $Decision.Substring(8)
@@ -129,4 +196,7 @@ if ($Decision -like 'FOCUS *') {
     Open-Pane
 } else {
     Open-Pane
+}
+} finally {
+    Remove-Item -LiteralPath $LockDir -Force -ErrorAction SilentlyContinue
 }

@@ -28,18 +28,12 @@ use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    DELETED, TitleAction, UNTRACKED, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
-    hits_collapse_button, sibling_panes_of, sparkle_icon, status_color, title_action_spans,
+    TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
+    hits_collapse_button, hover_style, keep_visible_scroll, palette, selection_style,
+    set_color_theme, sibling_panes_of, sparkle_icon, status_color, title_action_spans,
     title_actions_visible, title_actions_width, truncate_to, within, wrap_footer_message,
     wrap_hints,
 };
-
-// VS Code's dark-theme button colors; the git status colors themselves live
-// in `ui.rs` so the Explorer decorations use the very same palette.
-const BUTTON_BLUE: Color = Color::Rgb(0x00, 0x78, 0xd4);
-const BUTTON_BLUE_FOCUS: Color = Color::Rgb(0x02, 0x8a, 0xf0);
-const BADGE_BLUE: Color = Color::Rgb(0x00, 0x78, 0xd4);
-const HOVER_BG: Color = Color::Rgb(48, 52, 60);
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
@@ -402,6 +396,7 @@ enum Overlay {
     Settings {
         selected: usize,
         rect: Rect,
+        scroll: usize,
     },
 }
 
@@ -412,6 +407,7 @@ enum Setting {
     DockRight,
     SidebarWidth,
     IconTheme,
+    ColorTheme,
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
@@ -604,6 +600,10 @@ pub struct App {
     /// Shared across rebuilds and unified-view switches so a manual folder
     /// choice keeps its precedence until a known neighbour actually moves.
     cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+    /// Draft roots this pane loaded or successfully persisted. An empty box
+    /// only clears one of these roots, so a stale sibling pane cannot erase a
+    /// newer draft it never observed.
+    persisted_draft_roots: std::collections::BTreeSet<String>,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -613,7 +613,7 @@ impl App {
         cwd: PathBuf,
         cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
     ) -> Self {
-        let repos: Vec<Repo> = Git::discover_all(&cwd).into_iter().map(Repo::new).collect();
+        let mut repos: Vec<Repo> = Git::discover_all(&cwd).into_iter().map(Repo::new).collect();
         let discover_err = if repos.is_empty() {
             Git::discover(&cwd)
                 .err()
@@ -632,6 +632,7 @@ impl App {
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
+        set_color_theme(sidebar_state.color_theme);
         let pane_ctl = PaneCtl::from_env();
         let last_layout_width = pane_ctl.as_ref().and_then(PaneCtl::layout_width);
 
@@ -640,6 +641,7 @@ impl App {
         // the same repo active, and the same row selected. Parallel to the
         // explorer's tree-state restore.
         let saved = sidebar::load_scm_state(&cwd);
+        let persisted_draft_roots = saved.drafts.keys().cloned().collect();
         let mut drawers: [DrawerPanel; 8] = Default::default();
         for kind in Drawer::ALL {
             drawers[kind.index()].expanded = saved.drawers.iter().any(|d| d == kind.title());
@@ -657,6 +659,13 @@ impl App {
         let history_target = saved.history_target;
         let selected_id = saved.selected;
         let saved_scroll = saved.scroll;
+        for repo in &mut repos {
+            let root = sidebar::scm_path_key(repo.git.root());
+            if let Some(message) = saved.drafts.get(&root) {
+                repo.message = message.chars().collect();
+                repo.cursor = repo.message.len();
+            }
+        }
 
         let mut app = Self {
             repos,
@@ -693,6 +702,7 @@ impl App {
             last_beat: std::time::Instant::now(),
             picking: None,
             cwd_follower,
+            persisted_draft_roots,
         };
         app.apply_identity();
         app.refresh();
@@ -740,6 +750,12 @@ impl App {
         };
         ctl.set_label(Some(label));
         ctl.report_tokens(MY_VIEW, self.merged());
+    }
+
+    pub fn clear_identity(&self) {
+        if let Some(ctl) = &self.pane_ctl {
+            herdr_sidebar::ipc::clear_identity(&ctl.pane_id);
+        }
     }
 
     /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
@@ -830,6 +846,12 @@ impl App {
         let shared = sidebar::load_state();
         self.sidebar_state.git_deco = shared.git_deco;
         self.sidebar_state.dock_right = shared.dock_right;
+        self.sidebar_state.strict_toggle = shared.strict_toggle;
+        self.sidebar_state.focus_on_open = shared.focus_on_open;
+        if shared.color_theme != self.sidebar_state.color_theme {
+            self.sidebar_state.color_theme = shared.color_theme;
+            set_color_theme(shared.color_theme);
+        }
         if shared.sidebar_width != self.sidebar_state.sidebar_width {
             self.sidebar_state.sidebar_width = shared.sidebar_width;
             if let Some(ctl) = &self.pane_ctl {
@@ -1086,6 +1108,12 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        if key.code == KeyCode::Char('q')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return Some(Exit::Quit);
+        }
         self.flash = None;
         if self.overlay.is_some() {
             self.overlay_key(key);
@@ -1130,11 +1158,17 @@ impl App {
             KeyCode::Right => repo.cursor = (repo.cursor + 1).min(repo.message.len()),
             KeyCode::Home => repo.cursor = 0,
             KeyCode::End => repo.cursor = repo.message.len(),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('u')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 repo.message.clear();
                 repo.cursor = 0;
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 repo.message.insert(repo.cursor, c);
                 repo.cursor += 1;
             }
@@ -1612,15 +1646,21 @@ impl App {
         }
         let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
-            Some(Overlay::Settings { selected, rect }) => {
+            Some(Overlay::Settings {
+                selected,
+                rect,
+                scroll,
+            }) => {
                 // Rows start just inside the top border (the title renders ON
                 // the border, not on its own line).
                 let row_at = |row: u16, col: u16| -> Option<usize> {
+                    let index = usize::from(row.saturating_sub(rect.y + 1)) + *scroll;
                     (col > rect.x
                         && col < rect.x + rect.width.saturating_sub(1)
                         && row > rect.y
-                        && row < rect.y + 1 + row_count as u16)
-                        .then(|| usize::from(row - rect.y - 1))
+                        && row < rect.y + rect.height.saturating_sub(1)
+                        && index < row_count)
+                        .then_some(index)
                 };
                 match mouse.kind {
                     MouseEventKind::Moved => {
@@ -1701,6 +1741,7 @@ impl App {
         self.overlay = Some(Overlay::Settings {
             selected: 0,
             rect: Rect::default(),
+            scroll: 0,
         });
     }
 
@@ -1738,6 +1779,12 @@ impl App {
                     IconTheme::Emoji => "emoji",
                 }
                 .to_string(),
+                true,
+            ),
+            (
+                Setting::ColorTheme,
+                "Color theme",
+                self.sidebar_state.color_theme.label().to_string(),
                 true,
             ),
             (
@@ -1833,6 +1880,12 @@ impl App {
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
+            Setting::ColorTheme => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.color_theme = state.color_theme.other();
+                });
+                set_color_theme(self.sidebar_state.color_theme);
+            }
             Setting::Hotkeys => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.show_hotkeys = !state.show_hotkeys);
@@ -1944,7 +1997,12 @@ impl App {
         let width = desired_width.min(area.width);
         // The hotkey reference lives here now; the footer chips are opt-in.
         let hint_lines = wrap_hints(&self.hints(), width.saturating_sub(2), 0);
-        let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
+        let Some(Overlay::Settings {
+            selected,
+            rect,
+            scroll,
+        }) = self.overlay.as_mut()
+        else {
             return;
         };
         let height = (rows.len() as u16 + 5 + hint_lines.len() as u16).min(area.height);
@@ -1955,6 +2013,9 @@ impl App {
             height,
         );
         *rect = popup;
+        let inner_height = usize::from(height.saturating_sub(2));
+        let content_height = rows.len() + 3 + hint_lines.len();
+        *scroll = keep_visible_scroll(*selected, inner_height, content_height);
 
         let inner_w = usize::from(width.saturating_sub(2));
         let mut lines: Vec<Line> = Vec::new();
@@ -1964,9 +2025,7 @@ impl App {
             let style = if !enabled {
                 Style::default().dim()
             } else if i == *selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                selection_style(true)
             } else {
                 Style::default()
             };
@@ -1982,7 +2041,7 @@ impl App {
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(lines).block(
+            Paragraph::new(lines).scroll((*scroll as u16, 0)).block(
                 Block::bordered()
                     .title(" Settings ")
                     .border_style(Style::default().dim()),
@@ -2336,24 +2395,57 @@ impl App {
             .get(self.active)
             .map(|r| sidebar::scm_path_key(r.git.root()));
         let selected = self.selected.and_then(|i| self.row_stable_id(i));
+        let drafts = self
+            .repos
+            .iter()
+            .filter(|repo| !repo.message.is_empty())
+            .map(|repo| {
+                (
+                    sidebar::scm_path_key(repo.git.root()),
+                    repo.message.iter().collect(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let visible_roots = self
+            .repos
+            .iter()
+            .map(|repo| sidebar::scm_path_key(repo.git.root()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let cleared_drafts = self
+            .persisted_draft_roots
+            .iter()
+            .filter(|root| visible_roots.contains(*root) && !drafts.contains_key(*root))
+            .cloned()
+            .collect();
         sidebar::ScmState {
             drawers,
             active_root,
             selected,
             history_target: self.history_target.clone(),
             scroll: self.scroll,
+            drafts,
+            cleared_drafts,
         }
     }
 
     /// Persist the view state for the next sidebar started in this cwd.
-    fn persist_scm(&self) {
+    pub fn persist_scm(&mut self) -> bool {
         let snapshot = self.snapshot_scm();
-        sidebar::save_scm_state(&self.cwd, &snapshot);
+        let mut saved = sidebar::save_scm_state(&self.cwd, &snapshot);
         for repo in &self.repos {
             if repo.git.root() != self.cwd {
-                sidebar::save_scm_state(repo.git.root(), &snapshot);
+                saved &= sidebar::save_scm_state(repo.git.root(), &snapshot);
             }
         }
+        if saved {
+            self.persisted_draft_roots
+                .retain(|root| !snapshot.cleared_drafts.contains(root));
+            self.persisted_draft_roots
+                .extend(snapshot.drafts.keys().cloned());
+        } else {
+            self.flash = Some(("Could not save Source Control state; action cancelled.".into(), true));
+        }
+        saved
     }
 
     /// `o`: open the diff for the currently selected file row.
@@ -2664,6 +2756,7 @@ impl App {
             Err(e) => self.flash = Some((e, true)),
         }
         self.refresh();
+        self.persist_scm();
     }
 
     /// Screen lines a row occupies; the inline message boxes grow with
@@ -2819,7 +2912,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "«",
-                Style::default().bold().fg(Color::LightBlue),
+                Style::default().bold().fg(palette().header_accent),
             ))
             .centered(),
             footer_button,
@@ -2845,9 +2938,7 @@ impl App {
         let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                selection_style(true)
             } else {
                 Style::default().dim()
             }
@@ -2883,7 +2974,7 @@ impl App {
         let chip_w = chip_end.saturating_sub(chip_start);
         let cap = |glyph: &str| {
             Paragraph::new(glyph.repeat(usize::from(chip_w)))
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(palette().selection_bg))
         };
         frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
         frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
@@ -2974,7 +3065,7 @@ impl App {
     fn draw_message(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Message;
         let border = if focused {
-            Style::default().fg(BUTTON_BLUE)
+            Style::default().fg(palette().accent)
         } else {
             Style::default().dim()
         };
@@ -3032,11 +3123,11 @@ impl App {
     fn draw_button(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Commit;
         let bg = if focused {
-            BUTTON_BLUE_FOCUS
+            palette().accent_focus
         } else {
-            BUTTON_BLUE
+            palette().accent
         };
-        let mut style = Style::default().bg(bg).fg(Color::White);
+        let mut style = Style::default().bg(bg).fg(palette().accent_fg);
         if focused {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -3075,12 +3166,12 @@ impl App {
         };
         let style = if self.syncing.is_some() {
             Style::default()
-                .bg(Color::Rgb(0x2d, 0x2d, 0x33))
-                .fg(Color::Gray)
+                .bg(palette().sync_busy_bg)
+                .fg(palette().muted_button_fg)
         } else {
             Style::default()
-                .bg(Color::Rgb(0x3a, 0x3d, 0x41))
-                .fg(Color::White)
+                .bg(palette().sync_bg)
+                .fg(palette().accent_fg)
         };
         frame.render_widget(Paragraph::new(label).centered().style(style), area);
     }
@@ -3196,15 +3287,13 @@ impl App {
                 };
                 if selected == Some(i) {
                     let style = if list_focused {
-                        Style::default()
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD)
+                        selection_style(true)
                     } else {
-                        Style::default().bg(Color::Rgb(0x2a, 0x2d, 0x2e))
+                        selection_style(false)
                     };
                     item.style(style)
                 } else if hovered == Some(i) {
-                    item.style(Style::default().bg(HOVER_BG))
+                    item.style(hover_style())
                 } else {
                     item
                 }
@@ -3248,11 +3337,17 @@ impl App {
         let message: Option<(String, Color)> = match (&self.overlay, &self.flash) {
             (Some(Overlay::ConfirmDiscard { entry, .. }), _) => Some((
                 format!("Discard changes to '{}'? (y/N)", entry.path),
-                DELETED,
+                palette().deleted,
             )),
-            (Some(Overlay::ConfirmGit { prompt, .. }), _) => Some((prompt.clone(), DELETED)),
+            (Some(Overlay::ConfirmGit { prompt, .. }), _) => {
+                Some((prompt.clone(), palette().deleted))
+            }
             (_, Some((text, is_error))) => {
-                let color = if *is_error { DELETED } else { UNTRACKED };
+                let color = if *is_error {
+                    palette().deleted
+                } else {
+                    palette().untracked
+                };
                 let prefix = if *is_error { "" } else { "✓ " };
                 Some((format!("{prefix}{text}"), color))
             }
@@ -3351,9 +3446,7 @@ impl App {
                     let line = Line::raw(format!(" {label}"));
                     if i == *selected {
                         ListItem::new(line).style(
-                            Style::default()
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
+                            selection_style(true),
                         )
                     } else {
                         ListItem::new(line)
@@ -3486,7 +3579,7 @@ fn message_box_item(
     width: usize,
 ) -> ListItem<'static> {
     let border = if focused {
-        Style::default().fg(BUTTON_BLUE)
+        Style::default().fg(palette().accent)
     } else {
         Style::default().dim()
     };
@@ -3532,9 +3625,9 @@ fn message_box_item(
 /// right end; only the active repo's button is fully lit.
 fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'static> {
     let (bg, fg) = match (active, focused) {
-        (true, true) => (BUTTON_BLUE_FOCUS, Color::White),
-        (true, false) => (BUTTON_BLUE, Color::White),
-        (false, _) => (Color::Rgb(0x24, 0x45, 0x5c), Color::Rgb(0x9a, 0xb2, 0xc2)),
+        (true, true) => (palette().accent_focus, palette().accent_fg),
+        (true, false) => (palette().accent, palette().accent_fg),
+        (false, _) => (palette().muted_button_bg, palette().muted_button_fg),
     };
     let label = "✓ Commit";
     let body_w = width.saturating_sub(2);
@@ -3573,7 +3666,9 @@ fn section_item(
     };
     let badge = Span::styled(
         format!(" {count} "),
-        Style::default().bg(BADGE_BLUE).fg(Color::White),
+        Style::default()
+            .bg(palette().accent)
+            .fg(palette().accent_fg),
     );
     // Hovering shows the section-wide stage/unstage glyph before the badge.
     let action_span = action.map(|a| Span::styled(format!("{a} "), Style::default().bold()));
@@ -3603,7 +3698,9 @@ fn file_history_header(collapsed: bool, file: &str) -> ListItem<'static> {
 /// current branch (git's `%(HEAD)` renders it as `* name`).
 fn drawer_line(kind: Drawer, text: &str) -> ListItem<'static> {
     let style = match kind {
-        Drawer::Branches if text.starts_with('*') => Style::default().fg(UNTRACKED).bold(),
+        Drawer::Branches if text.starts_with('*') => {
+            Style::default().fg(palette().untracked).bold()
+        }
         _ => Style::default(),
     };
     ListItem::new(Line::from(Span::styled(format!("   {text}"), style)))

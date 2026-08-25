@@ -32,6 +32,10 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+`plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
+repository has Windows contributors and `core.autocrlf` is common, but these files are
+executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
+
 ## Plugin dev workflow
 
 - `herdr plugin link .` (from the plugin dir) registers the local checkout with the running
@@ -99,6 +103,9 @@ cargo clippy -- -D warnings
   Explorer/Source Control/Sidebar panes in every workspace, reaps only the ensure sidecar, and
   re-docks the focused workspace; preview/editor panes survive so unsaved buffers are preserved.
   The others re-dock via the focus hook the moment they're next visited.
+- Toggle-behavior settings have three platform launch paths to keep aligned: the Windows unified
+  sidecar (`ensure.rs`), the Windows separated Source Control launcher (`open-git.ps1`), and both
+  Unix launchers. Updating only the sidecar makes the same setting behave differently by view.
 - **os error 5 can come from ANOTHER Windows account**: if a second account's herdr session
   runs sidebar panes from this same checkout, its processes show empty Path/StartTime in
   `Get-Process`, `Stop-Process` fails silently on them, and redeploy from this account can't
@@ -110,16 +117,28 @@ cargo clippy -- -D warnings
 - Bump the version in THREE files: `Cargo.toml`, `herdr-plugin.toml`, and `Cargo.lock`
   (any cargo command regenerates the lock entry). Commit as `vX.Y.Z`, `git tag vX.Y.Z`,
   push branch + tag.
-- **Pushing a tag alone does NOT update the repo's "Latest" release badge** — also run
-  `gh release create vX.Y.Z --title vX.Y.Z --notes-file <md>`. House style for notes: a
-  headline `##`, Fixes/New sections referencing issue/PR numbers and crediting contributor
-  handles, and the `herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar`
-  snippet at the end.
+- Pushing the tag triggers `.github/workflows/release.yml`, which creates or updates the GitHub
+  release and uploads SHA-256-verified prebuilt assets. Wait for that workflow before announcing
+  the release; edit its generated notes to the house style (headline, Fixes/New sections with
+  issue/PR credit, and the install snippet) rather than creating a competing release manually.
+- Prebuilt selection is version-based and checksum-verified. Windows needs BOTH the main binary
+  and the GUI-subsystem ensure sidecar; a partial download must fall back to the source build.
+- Release assets use `herdr-sidebar[-ensure]-<rust-target>[.exe]` plus `SHA256SUMS`.
+  Platform-gated `[[build]]` entries fetch only the crate's declared version, verify before
+  moving either binary into `target/release`, and fall back to `cargo build --release` for
+  unsupported targets, missing assets, or mismatches. The `HS_*` seams are enabled only by
+  `HS_TEST_MODE=1`; never make production download origin or executable selection env-driven.
 - Merging contributor PRs locally (`git fetch origin pull/N/head:pr-N`, `git merge --no-ff
   pr-N`, push main) marks them MERGED on GitHub, and `Fixes #N`/`Closes #N` in commit
   messages auto-close the issues on push. Branch protection ("changes must be made through
   a pull request") is bypassable as repo admin — the push prints a rule-violation warning
   but succeeds.
+- Before merging fetched contributor commits, inspect `gh pr diff N --name-only | rg -i
+  '^\.(claude|codex)/|^CLAUDE\.md$|^\.github/workflows/'` for agent instructions and
+  workflow changes. `.claude/commands/` and `.codex/prompts/` are
+  maintainer-local, ignored, rejected by ordinary CI, and independently rejected by a
+  `pull_request_target` workflow that never checks out contributor code. A PR can still alter
+  `CLAUDE.md`, tracked skills, or workflows, so review those paths as instructions, not data.
 
 ### Testing hooks headless (no TUI attached)
 
@@ -154,8 +173,9 @@ Pane geometry & CLI semantics:
   sidebar HIDES (closes) rather than collapsing to a sliver. (Panes inside a NESTED split can be narrower than 10% of the
   window — the floor is per-split-rect — but the sidebar's column is a root-split child.)
 - There is no focus-by-id; focusing a pane is a `pane zoom <id> --on` / `--off` cycle.
-- `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
-  and plain characters work, but `Home` is rejected with `invalid_key` and
+- `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`,
+  lowercase modifier chords such as `ctrl+q`, and plain characters work, but `Home` is
+  rejected with `invalid_key` and
   `PageDown`/`PgDn`/`page-down`/`pgdn` are all rejected as unsupported too. Give TUIs
   single-char fallbacks (`g`/`G` for Home/End) so they stay drivable via send-keys.
 - A `pane list` snapshot goes stale the moment you `pane close` a pane: if the closed pane
@@ -224,6 +244,12 @@ e.g. `"ctrl"` → Ctrl+right-click reaches the app with ctrl stripped; a modifie
 plain-right-click passthrough is not supported). Same-tab `pane.move` is a deliberate no-op
 (`SameTab`) — restructure within a tab by bouncing the pane through `--new-tab` and back
 (herdr auto-closes the emptied temp tab).
+
+Plugin panes cannot read herdr's private UI palette. The `terminal` color theme therefore uses
+ANSI named colors that inherit the terminal profile; `vscode` remains the compatibility default
+with the historical fixed RGB values. Terminal selections use reverse-video instead of forcing a
+dark background, so light profiles remain readable. Keep every shared accent in `ui::Palette`
+so Explorer and Source Control cannot drift.
 
 Pane identity & titles:
 
@@ -378,8 +404,13 @@ HACKING.md — budget time for that before promising a patched build.
 - **`pane close` kills the TUI process with no chance to flush** (no signal/console-close
   it can catch in practice) — any debounced-autosave state inside the debounce window dies
   with it. Toggle-off launchers should first drive a graceful save+quit via
-  `pane send-keys <id> Escape q` (design the keymap so Esc-then-q saves and quits from
-  every mode), short sleep, THEN `pane close` as the cleanup.
+  `pane send-keys <id> ctrl+q`, poll until the identity token disappears, THEN
+  `pane close` as cleanup. Probe errors and save failures keep the live pane open rather
+  than treating uncertainty as acknowledgement, and explicit toggles surface a notification
+  instead of failing silently. Ctrl+Q is a
+  dedicated quit chord handled before overlays/focus modes; do not use Escape, which closes
+  a tab-scoped preview/editor. SCM snapshots include commit drafts keyed by repo root, so
+  graceful quit and ordinary `q` restore unfinished text on the next Source Control pane.
 
 ### Unified sidebar (see `src/state.rs`)
 
@@ -403,6 +434,10 @@ HACKING.md — budget time for that before promising a patched build.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
   Never write an app's startup snapshot wholesale: preview tabs run independent sidebar
   processes, and a stale snapshot silently reverts newer settings from another tab.
+- Separated Explorer and Source Control panes periodically re-read shared display settings,
+  including `color_theme`, `strict_toggle`, and `focus_on_open`; theme changes also update
+  the process palette immediately. The Settings modal scrolls to keep its selected row visible
+  when the pane is too short for all rows and hotkey hints.
 - `dock_right` in the same state file (default false) drives the “Dock on the right” Settings
   row. Launch target/ratio/swap, resize direction, and full-height repair all mirror from that
   one persisted choice. Preview tabs inherit it when the `tab.created` hook docks their sidebar.

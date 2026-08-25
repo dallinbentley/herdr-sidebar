@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::state::{self, View};
-use crate::ui::{KEYCAP_BG, KEYCAP_FG, wrap_footer_message};
+use crate::ui::{palette, wrap_footer_message};
 use crate::{actions, icons, ipc};
 
 const FONT_NAME: &str = "JetBrainsMono Nerd Font";
@@ -251,7 +251,11 @@ fn option_lines(key: &'static str, label: &str, width: u16) -> Vec<Line<'static>
         .enumerate()
         .map(|(i, l)| {
             let lead: Span<'static> = if i == 0 {
-                Span::styled(cap.clone(), Style::default().bg(KEYCAP_BG).fg(KEYCAP_FG))
+                let colors = palette();
+                Span::styled(
+                    cap.clone(),
+                    Style::default().bg(colors.keycap_bg).fg(colors.keycap_fg),
+                )
             } else {
                 Span::raw(" ".repeat(usize::from(cap_cols) - 1))
             };

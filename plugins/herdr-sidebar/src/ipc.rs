@@ -86,6 +86,25 @@ pub fn report_identity(pane_id: &str, my: crate::state::View, merged: bool) {
     );
 }
 
+/// Clear both sidebar identity tokens after the event loop has finished its
+/// final persistence. Launchers poll this acknowledgement before removing the
+/// now-idle shell pane.
+pub fn clear_identity(pane_id: &str) {
+    for view in [
+        crate::state::View::Explorer,
+        crate::state::View::SourceControl,
+    ] {
+        let _ = call_text(
+            "pane.report_metadata",
+            serde_json::json!({
+                "pane_id": pane_id,
+                "source": view.plugin_id(),
+                "tokens": { view.plugin_id(): serde_json::Value::Null },
+            }),
+        );
+    }
+}
+
 // Windows' named-pipe `File` handle has no `set_read_timeout` via std (no
 // overlapped I/O in this fix's scope), so it's bounded with a background
 // thread instead. unix sockets support native read/write timeouts, which

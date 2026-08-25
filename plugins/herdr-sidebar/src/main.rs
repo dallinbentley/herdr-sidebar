@@ -133,6 +133,7 @@ fn main() -> std::io::Result<()> {
         None
     };
     let persisted = state::load_state();
+    herdr_sidebar::ui::set_color_theme(persisted.color_theme);
     let mut view = pinned.unwrap_or(if persisted.merged {
         persisted.active
     } else {
@@ -243,6 +244,9 @@ fn run_explorer(
                 _ => None, // resize, focus, … simply fall through to a redraw
             };
             if let Some(exit) = exit {
+                if exit == Exit::Quit {
+                    app.clear_identity();
+                }
                 return Ok(exit);
             }
         }
@@ -282,6 +286,15 @@ fn run_scm(
                 _ => None,
             };
             if let Some(exit) = exit {
+                // Switching drops this App and rebuilds it later, so it needs
+                // the same persistence gate as quitting or a draft would be
+                // lost despite the process staying alive.
+                if !app.persist_scm() {
+                    continue;
+                }
+                if exit == Exit::Quit {
+                    app.clear_identity();
+                }
                 return Ok(exit);
             }
         }

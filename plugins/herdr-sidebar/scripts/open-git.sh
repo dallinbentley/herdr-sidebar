@@ -116,6 +116,26 @@ if [ -n "$panes" ]; then
   decision="$(printf '%s' "$panes" | "$bin" --launch-decision git 2>/dev/null || echo OPEN)"
 fi
 
+graceful_close() {
+  local pane_id=$1 listed present acknowledged=""
+  "$herdr_bin" pane send-keys "$pane_id" ctrl+q >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    sleep 0.1
+    if listed="$("$herdr_bin" pane list 2>/dev/null)" &&
+      present="$(printf '%s' "$listed" | "$bin" --pane-has-token "$pane_id" 2>/dev/null)"
+    then
+      if [ "$present" != "yes" ]; then acknowledged=1; break; fi
+    fi
+  done
+  if [ -n "$acknowledged" ]; then
+    "$herdr_bin" pane close "$pane_id" >/dev/null 2>&1 || true
+  else
+    "$herdr_bin" notification show "Sidebar close cancelled" \
+      --body "The pane did not acknowledge a safe shutdown; try again shortly." \
+      --position bottom-right --sound none >/dev/null 2>&1 || true
+  fi
+}
+
 case "$decision" in
   "FOCUS "*)
     pid="${decision#FOCUS }"
@@ -124,7 +144,7 @@ case "$decision" in
     ;;
   "CLOSE "*)
     pid="${decision#CLOSE }"
-    "$herdr_bin" pane close "$pid"
+    graceful_close "$pid"
     ;;
   "REPLACE "*)
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
