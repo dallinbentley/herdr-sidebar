@@ -5,42 +5,177 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::icons::IconTheme;
-use crate::state::View;
+use crate::state::{ColorTheme, View};
 
 /// Keycap chip colors for the footer hints — a subtle "keyboard key" look
 /// instead of a wall of dim text.
-pub const KEYCAP_BG: Color = Color::Rgb(0x32, 0x36, 0x3d);
-pub const KEYCAP_FG: Color = Color::Rgb(0xc9, 0xce, 0xd6);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub keycap_bg: Color,
+    pub keycap_fg: Color,
+    pub modified: Color,
+    pub untracked: Color,
+    pub added: Color,
+    pub renamed: Color,
+    pub deleted: Color,
+    pub conflict: Color,
+    pub ignored: Color,
+    pub selection_bg: Color,
+    pub selection_unfocused_bg: Color,
+    pub hover_bg: Color,
+    pub accent: Color,
+    pub accent_focus: Color,
+    pub accent_fg: Color,
+    pub muted_button_bg: Color,
+    pub muted_button_fg: Color,
+    pub sync_bg: Color,
+    pub sync_busy_bg: Color,
+    pub header_accent: Color,
+}
 
 // VS Code's dark-theme git decoration colors, shared by the Source Control
 // rows and the Explorer's status decorations (issue #19) so one status letter
 // always means one color.
-pub const MODIFIED: Color = Color::Rgb(0xe2, 0xc0, 0x8d);
-pub const UNTRACKED: Color = Color::Rgb(0x73, 0xc9, 0x91);
-pub const ADDED: Color = Color::Rgb(0x81, 0xb8, 0x8b);
-pub const RENAMED: Color = Color::Rgb(0x73, 0xc9, 0x91);
-pub const DELETED: Color = Color::Rgb(0xc7, 0x4e, 0x39);
-pub const CONFLICT: Color = Color::Rgb(0xe4, 0x67, 0x6b);
-/// Ignored paths render faded, like VS Code's `gitDecoration.ignoredResourceForeground`.
-pub const IGNORED: Color = Color::Rgb(0x6b, 0x6b, 0x6b);
+const VSCODE_PALETTE: Palette = Palette {
+    keycap_bg: Color::Rgb(0x32, 0x36, 0x3d),
+    keycap_fg: Color::Rgb(0xc9, 0xce, 0xd6),
+    modified: Color::Rgb(0xe2, 0xc0, 0x8d),
+    untracked: Color::Rgb(0x73, 0xc9, 0x91),
+    added: Color::Rgb(0x81, 0xb8, 0x8b),
+    renamed: Color::Rgb(0x73, 0xc9, 0x91),
+    deleted: Color::Rgb(0xc7, 0x4e, 0x39),
+    conflict: Color::Rgb(0xe4, 0x67, 0x6b),
+    ignored: Color::Rgb(0x6b, 0x6b, 0x6b),
+    selection_bg: Color::DarkGray,
+    selection_unfocused_bg: Color::Rgb(0x2a, 0x2d, 0x2e),
+    hover_bg: Color::Rgb(48, 52, 60),
+    accent: Color::Rgb(0x00, 0x78, 0xd4),
+    accent_focus: Color::Rgb(0x02, 0x8a, 0xf0),
+    accent_fg: Color::White,
+    muted_button_bg: Color::Rgb(0x24, 0x45, 0x5c),
+    muted_button_fg: Color::Rgb(0x9a, 0xb2, 0xc2),
+    sync_bg: Color::Rgb(0x3a, 0x3d, 0x41),
+    sync_busy_bg: Color::Rgb(0x2d, 0x2d, 0x33),
+    header_accent: Color::LightBlue,
+};
+
+const TERMINAL_PALETTE: Palette = Palette {
+    keycap_bg: Color::DarkGray,
+    keycap_fg: Color::White,
+    modified: Color::Yellow,
+    untracked: Color::Green,
+    added: Color::LightGreen,
+    renamed: Color::Green,
+    deleted: Color::Red,
+    conflict: Color::LightRed,
+    ignored: Color::DarkGray,
+    selection_bg: Color::DarkGray,
+    selection_unfocused_bg: Color::Black,
+    hover_bg: Color::Black,
+    accent: Color::Blue,
+    accent_focus: Color::LightBlue,
+    accent_fg: Color::White,
+    muted_button_bg: Color::Black,
+    muted_button_fg: Color::Gray,
+    sync_bg: Color::DarkGray,
+    sync_busy_bg: Color::Black,
+    header_accent: Color::LightBlue,
+};
+
+static ACTIVE_PALETTE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_color_theme(theme: ColorTheme) {
+    ACTIVE_PALETTE.store(u8::from(theme == ColorTheme::Terminal), Ordering::Relaxed);
+}
+
+pub fn palette_for(theme: ColorTheme) -> Palette {
+    match theme {
+        ColorTheme::VsCode => VSCODE_PALETTE,
+        ColorTheme::Terminal => TERMINAL_PALETTE,
+    }
+}
+
+pub fn palette() -> Palette {
+    if ACTIVE_PALETTE.load(Ordering::Relaxed) == 1 {
+        TERMINAL_PALETTE
+    } else {
+        VSCODE_PALETTE
+    }
+}
+
+fn active_color_theme() -> ColorTheme {
+    if ACTIVE_PALETTE.load(Ordering::Relaxed) == 1 {
+        ColorTheme::Terminal
+    } else {
+        ColorTheme::VsCode
+    }
+}
+
+fn selection_style_for(theme: ColorTheme, focused: bool) -> Style {
+    if theme == ColorTheme::Terminal {
+        if focused {
+            Style::default()
+                .bg(TERMINAL_PALETTE.selection_bg)
+                .fg(TERMINAL_PALETTE.keycap_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(TERMINAL_PALETTE.selection_unfocused_bg)
+                .fg(Color::White)
+        }
+    } else if focused {
+        Style::default()
+            .bg(VSCODE_PALETTE.selection_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(VSCODE_PALETTE.selection_unfocused_bg)
+    }
+}
+
+pub fn selection_style(focused: bool) -> Style {
+    selection_style_for(active_color_theme(), focused)
+}
+
+fn hover_style_for(theme: ColorTheme) -> Style {
+    if theme == ColorTheme::Terminal {
+        Style::default()
+            .bg(TERMINAL_PALETTE.hover_bg)
+            .fg(Color::Gray)
+    } else {
+        Style::default().bg(VSCODE_PALETTE.hover_bg)
+    }
+}
+
+pub fn hover_style() -> Style {
+    hover_style_for(active_color_theme())
+}
+
+pub fn keep_visible_scroll(selected: usize, visible: usize, content: usize) -> usize {
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(content.saturating_sub(visible))
+}
 
 /// The color for a git status letter (`crate::git::FileEntry::letter`, plus
 /// `I` for ignored). Shared vocabulary: the Explorer decorations and the
 /// Source Control list must never disagree about what `M` looks like.
 pub fn status_color(letter: char) -> Color {
+    let colors = palette();
     match letter {
-        'M' => MODIFIED,
-        'U' => UNTRACKED,
-        'A' => ADDED,
-        'R' | 'C' => RENAMED,
-        'D' => DELETED,
-        '!' => CONFLICT,
-        'I' => IGNORED,
+        'M' => colors.modified,
+        'U' => colors.untracked,
+        'A' => colors.added,
+        'R' | 'C' => colors.renamed,
+        'D' => colors.deleted,
+        '!' => colors.conflict,
+        'I' => colors.ignored,
         _ => Color::Reset,
     }
 }
@@ -58,6 +193,7 @@ pub fn wrap_hints(
     width: u16,
     reserve: u16,
 ) -> Vec<Line<'static>> {
+    let colors = palette();
     let width = usize::from(width.max(8));
     let reserve = usize::from(reserve);
     let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
@@ -73,7 +209,9 @@ pub fn wrap_hints(
         line.push(Span::raw(if line.is_empty() { " " } else { "  " }));
         line.push(Span::styled(
             format!(" {key} "),
-            Style::default().bg(KEYCAP_BG).fg(KEYCAP_FG),
+            Style::default()
+                .bg(colors.keycap_bg)
+                .fg(colors.keycap_fg),
         ));
         line.push(Span::styled(format!(" {label}"), Style::default().dim()));
         used += if line.len() == 3 { w } else { 2 + w };
@@ -217,7 +355,9 @@ pub fn title_action_spans(
         let w = Span::raw(chip.as_str()).width() as u16;
         let rect = Rect::new(cx, y, w, 1);
         let style = if hover.is_some_and(|(hx, hy)| hits(rect, hx, hy)) {
-            Style::default().bg(KEYCAP_BG)
+            Style::default()
+                .bg(palette().keycap_bg)
+                .fg(palette().keycap_fg)
         } else {
             Style::default().dim()
         };
@@ -359,6 +499,45 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_palette_uses_terminal_mapped_ansi_colors() {
+        let terminal = palette_for(ColorTheme::Terminal);
+        let vscode = palette_for(ColorTheme::VsCode);
+        assert_eq!(terminal.modified, Color::Yellow);
+        assert_eq!(terminal.untracked, Color::Green);
+        assert_eq!(terminal.accent, Color::Blue);
+        assert_eq!(terminal.selection_bg, Color::DarkGray);
+        assert_eq!(vscode.modified, Color::Rgb(0xe2, 0xc0, 0x8d));
+        assert_eq!(vscode.accent, Color::Rgb(0x00, 0x78, 0xd4));
+        assert_eq!(
+            selection_style_for(ColorTheme::Terminal, true).bg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            selection_style_for(ColorTheme::Terminal, true).fg,
+            Some(Color::White)
+        );
+        assert!(!selection_style_for(ColorTheme::Terminal, true)
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        let hover = hover_style_for(ColorTheme::Terminal);
+        assert_eq!(hover.bg, Some(Color::Black));
+        assert_eq!(hover.fg, Some(Color::Gray));
+        assert_eq!(
+            selection_style_for(ColorTheme::Terminal, false).fg,
+            Some(Color::White)
+        );
+    }
+
+    #[test]
+    fn settings_scroll_keeps_the_selected_row_visible() {
+        assert_eq!(keep_visible_scroll(0, 5, 12), 0);
+        assert_eq!(keep_visible_scroll(4, 5, 12), 0);
+        assert_eq!(keep_visible_scroll(5, 5, 12), 1);
+        assert_eq!(keep_visible_scroll(11, 5, 12), 7);
+        assert_eq!(keep_visible_scroll(2, 0, 12), 3);
+    }
 
     #[test]
     fn messages_wrap_to_narrow_panes() {

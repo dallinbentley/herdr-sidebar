@@ -133,6 +133,38 @@ impl View {
     }
 }
 
+/// Accent palette for the sidebar. `VsCode` preserves the historical RGB
+/// styling; `Terminal` uses ANSI colors so the terminal profile remaps them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorTheme {
+    VsCode,
+    Terminal,
+}
+
+impl ColorTheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VsCode => "vscode",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::VsCode => Self::Terminal,
+            Self::Terminal => Self::VsCode,
+        }
+    }
+
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name {
+            "vscode" => Some(Self::VsCode),
+            "terminal" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+}
+
 /// The sticky sidebar setting, shared by both plugins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct State {
@@ -145,6 +177,9 @@ pub struct State {
     /// probe). Set the moment they toggle `i` or the Settings row, so a
     /// wrong auto-guess is corrected once and stays corrected.
     pub icons: Option<crate::icons::IconTheme>,
+    /// Accent palette. Terminal mode uses ANSI colors that inherit the
+    /// terminal profile; VS Code preserves the original fixed RGB palette.
+    pub color_theme: ColorTheme,
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
@@ -153,6 +188,13 @@ pub struct State {
     /// open-sidebar toggle themselves (issue #8); the explicit toggle always
     /// works regardless.
     pub auto_open: bool,
+    /// The open-sidebar toggle treats an open-but-unfocused sidebar as CLOSE
+    /// instead of FOCUS: one press opens, the next press closes, wherever
+    /// focus is. Off keeps the historical open / focus / close cycle.
+    pub strict_toggle: bool,
+    /// Focus the sidebar once the toggle opens it. Off docks it in the
+    /// background: focus stays in the pane the toggle was invoked from.
+    pub focus_on_open: bool,
     /// Follow the live foreground cwd of a non-sidebar pane in this tab.
     /// Manual folder choices win until an already-observed pane changes cwd.
     pub follow_cwd: bool,
@@ -176,8 +218,11 @@ impl Default for State {
             active: View::Explorer,
             show_hotkeys: false,
             icons: None,
+            color_theme: ColorTheme::VsCode,
             font_prompt_done: false,
             auto_open: true,
+            strict_toggle: false,
+            focus_on_open: true,
             follow_cwd: true,
             git_deco: true,
             dock_right: false,
@@ -318,16 +363,19 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\"{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
         state.font_prompt_done,
         state.auto_open,
+        state.strict_toggle,
+        state.focus_on_open,
         state.follow_cwd,
         state.git_deco,
         state.dock_right,
-        clamp_sidebar_width(state.sidebar_width)
+        clamp_sidebar_width(state.sidebar_width),
+        state.color_theme.label()
     );
     let _ = std::fs::write(path, json);
 }
@@ -478,7 +526,8 @@ pub fn save_tree_state(root: &Path, state: &TreeState) {
 
 /// The SCM view state worth mirroring into a fresh sidebar: which drawers
 /// are expanded (by title), the active repo's root, a stable id for the
-/// selected row, the FILE HISTORY target, and the scroll offset.
+/// selected row, the FILE HISTORY target, the scroll offset, and commit
+/// drafts keyed by repository root.
 #[derive(Default)]
 pub struct ScmState {
     pub drawers: Vec<String>,
@@ -486,6 +535,10 @@ pub struct ScmState {
     pub selected: Option<String>,
     pub history_target: Option<String>,
     pub scroll: usize,
+    pub drafts: std::collections::BTreeMap<String, String>,
+    /// Draft roots this pane previously observed and has since emptied.
+    /// Kept out of the JSON shape; it only scopes merge-on-write removals.
+    pub cleared_drafts: std::collections::BTreeSet<String>,
 }
 
 fn scm_path() -> Option<PathBuf> {
@@ -547,6 +600,21 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         scroll: entry.get("scroll").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        drafts: entry
+            .get("drafts")
+            .and_then(|v| v.as_object())
+            .map(|drafts| {
+                drafts
+                    .iter()
+                    .filter_map(|(root, message)| {
+                        message
+                            .as_str()
+                            .map(|message| (scm_path_key(Path::new(root)), message.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        cleared_drafts: std::collections::BTreeSet::new(),
     }
 }
 
@@ -558,19 +626,25 @@ pub fn load_scm_state(cwd: &Path) -> ScmState {
     scm_state_for(&decode_scm_file(&json), cwd)
 }
 
-/// Best-effort persist of `cwd`'s entry, leaving every other cwd's alone.
-pub fn save_scm_state(cwd: &Path, state: &ScmState) {
-    let Some(path) = scm_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// Persist `cwd`'s entry, leaving every other cwd's alone. Returns false when
+/// the write cannot be completed, so a graceful-close caller can keep the TUI
+/// alive instead of acknowledging data it did not save.
+pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
+    let Some(path) = scm_path() else { return false };
+    if let Some(dir) = path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return false;
     }
     let Some(_lock) = StateWriteLock::acquire(&path) else {
-        return;
+        return false;
     };
     let mut file = std::fs::read_to_string(&path)
         .map(|json| decode_scm_file(&json))
         .unwrap_or_default();
     let key = scm_path_key(cwd);
+    let mut drafts = scm_state_for(&file, cwd).drafts;
+    merge_scm_drafts(&mut drafts, state);
     file.retain(|stored, _| scm_path_key(Path::new(stored)) != key);
     file.insert(
         key,
@@ -580,11 +654,22 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) {
             "selected": state.selected,
             "history_target": state.history_target,
             "scroll": state.scroll,
+            "drafts": drafts,
         }),
     );
-    if let Ok(json) = serde_json::to_string(&file) {
-        let _ = std::fs::write(path, json);
+    serde_json::to_string(&file)
+        .ok()
+        .is_some_and(|json| std::fs::write(path, json).is_ok())
+}
+
+fn merge_scm_drafts(
+    stored: &mut std::collections::BTreeMap<String, String>,
+    state: &ScmState,
+) {
+    for root in &state.cleared_drafts {
+        stored.remove(root);
     }
+    stored.extend(state.drafts.clone());
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +767,11 @@ pub fn parse_state(json: &str) -> State {
             .get("icons")
             .and_then(|v| v.as_str())
             .and_then(crate::icons::IconTheme::from_state_name),
+        color_theme: value
+            .get("colors")
+            .and_then(|v| v.as_str())
+            .and_then(ColorTheme::from_state_name)
+            .unwrap_or(default.color_theme),
         font_prompt_done: value
             .get("font_prompt")
             .and_then(|v| v.as_bool())
@@ -690,6 +780,14 @@ pub fn parse_state(json: &str) -> State {
             .get("auto_open")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.auto_open),
+        strict_toggle: value
+            .get("strict_toggle")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.strict_toggle),
+        focus_on_open: value
+            .get("focus_on_open")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.focus_on_open),
         follow_cwd: value
             .get("follow_cwd")
             .and_then(|v| v.as_bool())
@@ -781,13 +879,34 @@ mod tests {
     #[test]
     fn scm_keys_ignore_windows_separator_spelling() {
         let file = decode_scm_file(
-            r#"{"C:/repo":{"drawers":["CHANGES"],"active_root":"C:/repo","scroll":4}}"#,
+            r#"{"C:/repo":{"drawers":["CHANGES"],"active_root":"C:/repo","scroll":4,"drafts":{"C:/repo":"keep me"}}}"#,
         );
         let state = scm_state_for(&file, Path::new(r"C:\repo"));
         assert_eq!(state.drawers, vec!["CHANGES"]);
         assert_eq!(state.active_root.as_deref(), Some("C:/repo"));
         assert_eq!(state.scroll, 4);
+        assert_eq!(state.drafts.get("C:/repo").map(String::as_str), Some("keep me"));
         assert_eq!(scm_path_key(Path::new(r"C:\repo\src")), "C:/repo/src");
+    }
+
+    #[test]
+    fn scm_draft_merge_preserves_unobserved_sibling_writes() {
+        let mut stored = std::collections::BTreeMap::from([
+            ("/repo/a".to_string(), "newer sibling draft".to_string()),
+            ("/repo/b".to_string(), "draft to clear".to_string()),
+        ]);
+        let mut state = ScmState::default();
+        state
+            .cleared_drafts
+            .insert("/repo/b".to_string());
+
+        merge_scm_drafts(&mut stored, &state);
+
+        assert_eq!(
+            stored.get("/repo/a").map(String::as_str),
+            Some("newer sibling draft")
+        );
+        assert!(!stored.contains_key("/repo/b"));
     }
 
     /// Older files were a bare array, then a flat object. Both predate
@@ -816,19 +935,30 @@ mod tests {
             active: View::SourceControl,
             show_hotkeys: true,
             icons: Some(crate::icons::IconTheme::Emoji),
+            color_theme: ColorTheme::Terminal,
             font_prompt_done: true,
             auto_open: false,
+            strict_toggle: true,
+            focus_on_open: false,
             follow_cwd: false,
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
         // decorations on.
         assert!(parse_state("{\"merged\":true}").auto_open);
+        // Files written before the toggle settings existed keep the
+        // historical toggle behavior: focus an open sidebar, focus on open.
+        assert!(!parse_state("{\"merged\":true}").strict_toggle);
+        assert!(parse_state("{\"merged\":true}").focus_on_open);
+        assert_eq!(
+            parse_state("{\"merged\":true}").color_theme,
+            ColorTheme::VsCode
+        );
         // Existing installs get neighbour following by default.
         assert!(parse_state("{\"merged\":true}").follow_cwd);
         assert!(parse_state("{\"merged\":true}").git_deco);

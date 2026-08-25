@@ -20,7 +20,8 @@
         "required_status_checks": [
           { "context": "build + test + clippy (windows-latest)" },
           { "context": "build + test + clippy (ubuntu-latest)" },
-          { "context": "build + test + clippy (macos-latest)" }
+          { "context": "build + test + clippy (macos-latest)" },
+          { "context": "maintainer-only command paths" }
         ] } }
   ]
 }

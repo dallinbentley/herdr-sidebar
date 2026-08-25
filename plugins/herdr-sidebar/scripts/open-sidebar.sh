@@ -87,16 +87,25 @@ open_pane() {
 
   # Left docking swaps into the narrow left slot; right docking is already
   # in place. PATH makes the same bare launch work in any configured shell.
+  focus_open="$("$bin" --focus-on-open 2>/dev/null || echo on)"
   if [ "$needs_swap" = "true" ]; then
     "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
+    if [ "$focus_open" != "on" ] && [ "$target" = "$fid" ]; then
+      # "Focus on open: off" (⚙ Settings): the sidebar docks in the
+      # background, but the swap drags focus onto the explorer slot (focus
+      # follows the slot). Hand it back right away, the ensure hook's move.
+      "$herdr_bin" pane focus --direction right --pane "$np" >/dev/null 2>&1 || true
+    fi
   fi
   "$herdr_bin" pane run "$np" "herdr-sidebar"
   "$herdr_bin" pane rename "$np" Explorer >/dev/null 2>&1 || true
   # Give the TUI time to stamp its identity token before hooks re-check.
   sleep 3
-  # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
-  "$herdr_bin" pane zoom "$np" --on >/dev/null 2>&1 || true
-  "$herdr_bin" pane zoom "$np" --off
+  if [ "$focus_open" = "on" ]; then
+    # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
+    "$herdr_bin" pane zoom "$np" --on >/dev/null 2>&1 || true
+    "$herdr_bin" pane zoom "$np" --off
+  fi
 }
 
 decision="OPEN"
@@ -108,6 +117,26 @@ fi
 # toggled closed; toggling open clears the tab's marker again.
 snooze_dir="${TMPDIR:-/tmp}/herdr-sidebar-snooze"
 tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
+
+graceful_close() {
+  local pane_id=$1 listed present acknowledged=""
+  "$herdr_bin" pane send-keys "$pane_id" ctrl+q >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    sleep 0.1
+    if listed="$("$herdr_bin" pane list 2>/dev/null)" &&
+      present="$(printf '%s' "$listed" | "$bin" --pane-has-token "$pane_id" 2>/dev/null)"
+    then
+      if [ "$present" != "yes" ]; then acknowledged=1; break; fi
+    fi
+  done
+  if [ -n "$acknowledged" ]; then
+    "$herdr_bin" pane close "$pane_id" >/dev/null 2>&1 || true
+  else
+    "$herdr_bin" notification show "Sidebar close cancelled" \
+      --body "The pane did not acknowledge a safe shutdown; try again shortly." \
+      --position bottom-right --sound none >/dev/null 2>&1 || true
+  fi
+}
 
 case "$decision" in
   "FOCUS "*)
@@ -121,7 +150,7 @@ case "$decision" in
       mkdir -p "$snooze_dir" 2>/dev/null
       : > "$snooze_dir/${tab//:/_}"
     fi
-    "$herdr_bin" pane close "$pid"
+    graceful_close "$pid"
     ;;
   "REPLACE "*)
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.

@@ -33,11 +33,18 @@ fn main() -> std::io::Result<()> {
             // answers for one tab while the dock lands in another.
             let now = state::unix_now();
             let scope = std::env::args().nth(3).unwrap_or_default();
-            let out = if std::env::args().nth(2).as_deref() == Some("git") {
+            let mut out = if std::env::args().nth(2).as_deref() == Some("git") {
                 launch::launch_decision_git(&read_stdin()?, now)
             } else {
                 launch::launch_decision_in(&read_stdin()?, now, &scope)
             };
+            // Strict toggle (⚙ Settings): report an open-but-unfocused pane
+            // as CLOSE so the toggle launchers close it instead of focusing
+            // it first. Safe for the ensure hook, which ignores FOCUS and
+            // CLOSE alike (it only acts on OPEN and REPLACE).
+            if state::load_state().strict_toggle {
+                out = launch::focus_as_close(&out);
+            }
             println!("{out}");
             return Ok(());
         }
@@ -83,6 +90,13 @@ fn main() -> std::io::Result<()> {
             println!("{}", if state::load_state().auto_open { "on" } else { "off" });
             return Ok(());
         }
+        Some("--focus-on-open") => {
+            // For the unix toggle launchers: skip the open-then-focus zoom
+            // cycle when the user turned "Focus on open" off in ⚙ Settings,
+            // so the sidebar docks in the background.
+            println!("{}", if state::load_state().focus_on_open { "on" } else { "off" });
+            return Ok(());
+        }
         Some("--dock-right") => {
             println!("{}", if state::load_state().dock_right { "right" } else { "left" });
             return Ok(());
@@ -104,7 +118,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -119,6 +133,7 @@ fn main() -> std::io::Result<()> {
         None
     };
     let persisted = state::load_state();
+    herdr_sidebar::ui::set_color_theme(persisted.color_theme);
     let mut view = pinned.unwrap_or(if persisted.merged {
         persisted.active
     } else {
@@ -229,6 +244,9 @@ fn run_explorer(
                 _ => None, // resize, focus, … simply fall through to a redraw
             };
             if let Some(exit) = exit {
+                if exit == Exit::Quit {
+                    app.clear_identity();
+                }
                 return Ok(exit);
             }
         }
@@ -268,6 +286,15 @@ fn run_scm(
                 _ => None,
             };
             if let Some(exit) = exit {
+                // Switching drops this App and rebuilds it later, so it needs
+                // the same persistence gate as quitting or a draft would be
+                // lost despite the process staying alive.
+                if !app.persist_scm() {
+                    continue;
+                }
+                if exit == Exit::Quit {
+                    app.clear_identity();
+                }
                 return Ok(exit);
             }
         }

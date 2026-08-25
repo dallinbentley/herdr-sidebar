@@ -4,7 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -20,8 +22,9 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, draw_scrollbar, gear_icon, hits, hits_collapse_button, input_tail,
-    sibling_panes_of, status_color, title_action_spans, title_actions_visible, title_actions_width,
-    truncate_to, wrap_footer_message, wrap_hints,
+    hover_style, keep_visible_scroll, palette, selection_style, set_color_theme,
+    sibling_panes_of, status_color, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -171,6 +174,7 @@ enum Overlay {
     Settings {
         selected: usize,
         rect: Rect,
+        scroll: usize,
     },
 }
 
@@ -181,7 +185,10 @@ enum Setting {
     DockRight,
     SidebarWidth,
     IconTheme,
+    ColorTheme,
     AutoOpen,
+    StrictToggle,
+    FocusOnOpen,
     FollowCwd,
     HiddenFiles,
     Hotkeys,
@@ -311,6 +318,7 @@ impl App {
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
+        set_color_theme(sidebar_state.color_theme);
         let repos = if sidebar_state.git_deco {
             Git::discover_all(&tree.root_path())
         } else {
@@ -377,6 +385,12 @@ impl App {
     fn sync_shared_settings(&mut self) {
         let shared = sidebar::load_state();
         self.sidebar_state.dock_right = shared.dock_right;
+        self.sidebar_state.strict_toggle = shared.strict_toggle;
+        self.sidebar_state.focus_on_open = shared.focus_on_open;
+        if shared.color_theme != self.sidebar_state.color_theme {
+            self.sidebar_state.color_theme = shared.color_theme;
+            set_color_theme(shared.color_theme);
+        }
         if shared.sidebar_width != self.sidebar_state.sidebar_width {
             self.sidebar_state.sidebar_width = shared.sidebar_width;
             if let Some(ctl) = &self.pane_ctl {
@@ -536,6 +550,12 @@ impl App {
         ctl.report_tokens(MY_VIEW, self.merged());
     }
 
+    pub fn clear_identity(&self) {
+        if let Some(ctl) = &self.pane_ctl {
+            herdr_sidebar::ipc::clear_identity(&ctl.pane_id);
+        }
+    }
+
     /// Open a file in the preview pane BESIDE the sidebar (the tree stays
     /// visible): the shared viewer client reuses the tab's viewer pane or
     /// spawns one next to us.
@@ -672,6 +692,12 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
             return None;
+        }
+        if key.code == KeyCode::Char('q')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return Some(Exit::Quit);
         }
         self.notice = None;
         if self.overlay.is_some() {
@@ -996,15 +1022,21 @@ impl App {
         }
         let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
-            Some(Overlay::Settings { selected, rect }) => {
+            Some(Overlay::Settings {
+                selected,
+                rect,
+                scroll,
+            }) => {
                 // Rows start just inside the top border (the title renders ON
                 // the border, not on its own line).
                 let row_at = |row: u16, col: u16| -> Option<usize> {
+                    let index = usize::from(row.saturating_sub(rect.y + 1)) + *scroll;
                     (col > rect.x
                         && col < rect.x + rect.width.saturating_sub(1)
                         && row > rect.y
-                        && row < rect.y + 1 + row_count as u16)
-                        .then(|| usize::from(row - rect.y - 1))
+                        && row < rect.y + rect.height.saturating_sub(1)
+                        && index < row_count)
+                        .then_some(index)
                 };
                 match mouse.kind {
                     MouseEventKind::Moved => {
@@ -1091,6 +1123,7 @@ impl App {
         self.overlay = Some(Overlay::Settings {
             selected: 0,
             rect: Rect::default(),
+            scroll: 0,
         });
     }
 
@@ -1131,6 +1164,12 @@ impl App {
                 true,
             ),
             (
+                Setting::ColorTheme,
+                "Color theme",
+                self.sidebar_state.color_theme.label().to_string(),
+                true,
+            ),
+            (
                 Setting::HiddenFiles,
                 "Hidden files",
                 if self.tree.show_hidden {
@@ -1156,6 +1195,28 @@ impl App {
                 Setting::AutoOpen,
                 "Auto-open sidebar",
                 if self.sidebar_state.auto_open {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
+                Setting::StrictToggle,
+                "Strict toggle",
+                if self.sidebar_state.strict_toggle {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
+                Setting::FocusOnOpen,
+                "Focus on open",
+                if self.sidebar_state.focus_on_open {
                     "on"
                 } else {
                     "off"
@@ -1209,6 +1270,12 @@ impl App {
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
+            Setting::ColorTheme => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.color_theme = state.color_theme.other();
+                });
+                set_color_theme(self.sidebar_state.color_theme);
+            }
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;
                 self.rebuild();
@@ -1220,6 +1287,14 @@ impl App {
             Setting::AutoOpen => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_open = !state.auto_open);
+            }
+            Setting::StrictToggle => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.strict_toggle = !state.strict_toggle);
+            }
+            Setting::FocusOnOpen => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.focus_on_open = !state.focus_on_open);
             }
             Setting::FollowCwd => {
                 self.sidebar_state =
@@ -1265,7 +1340,12 @@ impl App {
         let width = desired_width.min(area.width);
         // The hotkey reference lives here now; the footer chips are opt-in.
         let hint_lines = wrap_hints(&self.hints(), width.saturating_sub(2), 0);
-        let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
+        let Some(Overlay::Settings {
+            selected,
+            rect,
+            scroll,
+        }) = self.overlay.as_mut()
+        else {
             return;
         };
         let height = (rows.len() as u16 + 5 + hint_lines.len() as u16).min(area.height);
@@ -1276,6 +1356,9 @@ impl App {
             height,
         );
         *rect = popup;
+        let inner_height = usize::from(height.saturating_sub(2));
+        let content_height = rows.len() + 3 + hint_lines.len();
+        *scroll = keep_visible_scroll(*selected, inner_height, content_height);
 
         let inner_w = usize::from(width.saturating_sub(2));
         let mut lines: Vec<Line> = Vec::new();
@@ -1285,9 +1368,7 @@ impl App {
             let style = if !enabled {
                 Style::default().dim()
             } else if i == *selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                selection_style(true)
             } else {
                 Style::default()
             };
@@ -1303,7 +1384,7 @@ impl App {
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(lines).block(
+            Paragraph::new(lines).scroll((*scroll as u16, 0)).block(
                 ratatui::widgets::Block::bordered()
                     .title(" Settings ")
                     .border_style(Style::default().dim()),
@@ -1786,7 +1867,7 @@ impl App {
         let [_, footer_button] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
         frame.render_widget(
-            Paragraph::new("«".bold().fg(Color::LightBlue)).alignment(Alignment::Center),
+            Paragraph::new("«".bold().fg(palette().header_accent)).alignment(Alignment::Center),
             footer_button,
         );
         let footer_lines: Vec<Line> = if let Some((msg, color)) = self.footer_message() {
@@ -1882,7 +1963,10 @@ impl App {
         // The name yields to the buttons and gear in narrow panes.
         let avail = usize::from(area.width.saturating_sub(gear_w + actions_w));
         let root_label = truncate_to(format!(" {}", self.tree.root_name().to_uppercase()), avail);
-        let name = Span::styled(root_label, Style::default().bold().fg(Color::LightBlue));
+        let name = Span::styled(
+            root_label,
+            Style::default().bold().fg(palette().header_accent),
+        );
         let pad = usize::from(area.width)
             .saturating_sub(name.width() + usize::from(actions_w) + usize::from(gear_w));
         let mut spans = vec![name, Span::raw(" ".repeat(pad))];
@@ -1953,14 +2037,17 @@ impl App {
     /// delete confirm. Shared by footer_height and draw so they agree.
     fn footer_message(&self) -> Option<(String, Color)> {
         if let Some(notice) = &self.notice {
-            return Some((notice.clone(), Color::Yellow));
+            return Some((notice.clone(), palette().modified));
         }
         if let Some(Overlay::ConfirmDelete { path, .. }) = &self.overlay {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            return Some((format!("Delete '{name}' permanently? (y/N)"), Color::Red));
+            return Some((
+                format!("Delete '{name}' permanently? (y/N)"),
+                palette().deleted,
+            ));
         }
         None
     }
@@ -1977,9 +2064,7 @@ impl App {
         let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                selection_style(true)
             } else {
                 Style::default().dim()
             }
@@ -2017,7 +2102,7 @@ impl App {
         let chip_w = chip_end.saturating_sub(chip_start);
         let cap = |glyph: &str| {
             Paragraph::new(glyph.repeat(usize::from(chip_w)))
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(palette().selection_bg))
         };
         frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
         frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
@@ -2078,9 +2163,7 @@ impl App {
                     let line = Line::raw(format!(" {label}"));
                     if i == *selected {
                         ListItem::new(line).style(
-                            Style::default()
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
+                            selection_style(true),
                         )
                     } else {
                         ListItem::new(line)
@@ -2159,14 +2242,10 @@ fn row_item(
 /// content so a git decoration (foreground-only) can never collide with it.
 fn row_bg(hovered: bool, selected: bool) -> Option<Style> {
     if selected {
-        Some(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        Some(selection_style(true))
     } else if hovered {
         // Subtler than the selection bg — hover is a hint, not a choice.
-        Some(Style::default().bg(Color::Rgb(48, 52, 60)))
+        Some(hover_style())
     } else {
         None
     }
@@ -2397,11 +2476,11 @@ mod tests {
         // name, or a selected changed row would be unreadable.
         assert_eq!(
             row_bg(false, true).and_then(|s| s.bg),
-            Some(Color::DarkGray)
+            Some(palette().selection_bg)
         );
         assert_eq!(
             row_bg(true, false).and_then(|s| s.bg),
-            Some(Color::Rgb(48, 52, 60))
+            Some(palette().hover_bg)
         );
         assert_eq!(row_bg(false, false), None);
         // The decoration itself only ever sets a foreground.
