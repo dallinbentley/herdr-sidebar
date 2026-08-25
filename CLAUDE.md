@@ -247,9 +247,10 @@ plain-right-click passthrough is not supported). Same-tab `pane.move` is a delib
 
 Plugin panes cannot read herdr's private UI palette. The `terminal` color theme therefore uses
 ANSI named colors that inherit the terminal profile; `vscode` remains the compatibility default
-with the historical fixed RGB values. Terminal selections use reverse-video instead of forcing a
-dark background, so light profiles remain readable. Keep every shared accent in `ui::Palette`
-so Explorer and Source Control cannot drift.
+with the historical fixed RGB values. Terminal selections use ANSI `DarkGray`/`White`, not
+reverse-video: reverse also swaps per-span git decoration colors and turns a green status dot into
+a green background block. Keep every shared accent in `ui::Palette` so Explorer and Source Control
+cannot drift.
 
 Pane identity & titles:
 

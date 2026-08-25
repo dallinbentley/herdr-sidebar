@@ -119,11 +119,15 @@ fn active_color_theme() -> ColorTheme {
 
 fn selection_style_for(theme: ColorTheme, focused: bool) -> Style {
     if theme == ColorTheme::Terminal {
-        let style = Style::default().add_modifier(Modifier::REVERSED);
         if focused {
-            style.add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(TERMINAL_PALETTE.selection_bg)
+                .fg(TERMINAL_PALETTE.keycap_fg)
+                .add_modifier(Modifier::BOLD)
         } else {
-            style
+            Style::default()
+                .bg(TERMINAL_PALETTE.selection_unfocused_bg)
+                .fg(Color::White)
         }
     } else if focused {
         Style::default()
@@ -138,12 +142,18 @@ pub fn selection_style(focused: bool) -> Style {
     selection_style_for(active_color_theme(), focused)
 }
 
-pub fn hover_style() -> Style {
-    if active_color_theme() == ColorTheme::Terminal {
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+fn hover_style_for(theme: ColorTheme) -> Style {
+    if theme == ColorTheme::Terminal {
+        Style::default()
+            .bg(TERMINAL_PALETTE.hover_bg)
+            .fg(Color::Gray)
     } else {
         Style::default().bg(VSCODE_PALETTE.hover_bg)
     }
+}
+
+pub fn hover_style() -> Style {
+    hover_style_for(active_color_theme())
 }
 
 pub fn keep_visible_scroll(selected: usize, visible: usize, content: usize) -> usize {
@@ -345,7 +355,9 @@ pub fn title_action_spans(
         let w = Span::raw(chip.as_str()).width() as u16;
         let rect = Rect::new(cx, y, w, 1);
         let style = if hover.is_some_and(|(hx, hy)| hits(rect, hx, hy)) {
-            Style::default().bg(palette().keycap_bg)
+            Style::default()
+                .bg(palette().keycap_bg)
+                .fg(palette().keycap_fg)
         } else {
             Style::default().dim()
         };
@@ -498,15 +510,23 @@ mod tests {
         assert_eq!(terminal.selection_bg, Color::DarkGray);
         assert_eq!(vscode.modified, Color::Rgb(0xe2, 0xc0, 0x8d));
         assert_eq!(vscode.accent, Color::Rgb(0x00, 0x78, 0xd4));
-        assert!(
-            selection_style_for(ColorTheme::Terminal, true)
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
         assert_eq!(
             selection_style_for(ColorTheme::Terminal, true).bg,
-            None,
-            "adaptive selection must not force a dark background"
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            selection_style_for(ColorTheme::Terminal, true).fg,
+            Some(Color::White)
+        );
+        assert!(!selection_style_for(ColorTheme::Terminal, true)
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        let hover = hover_style_for(ColorTheme::Terminal);
+        assert_eq!(hover.bg, Some(Color::Black));
+        assert_eq!(hover.fg, Some(Color::Gray));
+        assert_eq!(
+            selection_style_for(ColorTheme::Terminal, false).fg,
+            Some(Color::White)
         );
     }
 
