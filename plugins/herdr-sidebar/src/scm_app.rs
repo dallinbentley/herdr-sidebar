@@ -1220,18 +1220,18 @@ impl App {
         None
     }
 
-    /// FORK(review view): toggle a reviewr pane beside the sidebar — the
-    /// same slot file previews use — leaving the sidebar in place.
+    /// FORK(review view): hand the pane to herdr-reviewr (main.rs runs it),
+    /// or explain how to install it.
     fn open_review(&mut self) -> Option<Exit> {
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
-            self.flash = Some(("review needs a herdr pane".into(), true));
-            return None;
-        };
-        let root = self.root_path().to_path_buf();
-        if let Err(e) = herdr_sidebar::viewer::toggle_review(&pane_id, &root) {
-            self.flash = Some((e, true));
+        if herdr_sidebar::launch::resolve_reviewr().is_some() {
+            Some(Exit::Review)
+        } else {
+            self.flash = Some((
+                "reviewr not found — herdr plugin install persiyanov/herdr-reviewr".into(),
+                true,
+            ));
+            None
         }
-        None
     }
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
