@@ -177,12 +177,71 @@ fn main() -> std::io::Result<()> {
             Ok(Exit::Switch) => {
                 view = view.other();
             }
+            Ok(Exit::Review) => {
+                // FORK(review view): hand the terminal to herdr-reviewr in
+                // this same pane, widened for diffs, then take it back.
+                let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+                ratatui::restore();
+                run_reviewr(&workspace_label);
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                    crossterm::cursor::MoveTo(0, 0),
+                );
+                crossterm::style::force_color_output(true);
+                terminal = ratatui::init();
+                let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+            }
             Err(e) => break Err(e),
         }
     };
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// FORK(review view): reviewr wants room for diffs — the column width the
+/// sidebar pane grows to while it runs.
+const REVIEW_COLS: u16 = 110;
+
+/// Widen this pane, run `herdr-reviewr` rooted at the tree's directory until
+/// the user quits it, then shrink back to the persisted sidebar width.
+fn run_reviewr(workspace_label: &str) {
+    let Some(bin) = launch::resolve_reviewr() else {
+        return;
+    };
+    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+    let persisted = state::load_state();
+    let current = crossterm::terminal::size().map(|(cols, _)| cols).unwrap_or(0);
+    resize_pane(&pane_id, current, REVIEW_COLS, persisted.dock_right);
+    let root = resolve_root(workspace_label).unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let _ = std::process::Command::new(bin).current_dir(root).status();
+    let now = crossterm::terminal::size().map(|(cols, _)| cols).unwrap_or(0);
+    resize_pane(&pane_id, now, persisted.sidebar_width, persisted.dock_right);
+}
+
+fn resize_pane(pane_id: &str, current: u16, target: u16, dock_right: bool) {
+    if pane_id.is_empty() || current == 0 || current == target {
+        return;
+    }
+    let Ok(layout) = herdr_sidebar::ipc::call_text(
+        "pane.layout",
+        serde_json::json!({ "pane_id": pane_id }),
+    ) else {
+        return;
+    };
+    let Some(step) = launch::resize_plan(&layout, pane_id, current, target, dock_right) else {
+        return;
+    };
+    let _ = herdr_sidebar::ipc::call_text(
+        "pane.resize",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "direction": step.direction,
+            "amount": step.amount,
+        }),
+    );
 }
 
 fn read_stdin() -> std::io::Result<String> {
