@@ -61,9 +61,6 @@ pub enum Exit {
     Quit,
     /// The user picked the other view — main re-renders in process.
     Switch,
-    /// FORK(review view): hand the pane to the external `herdr-reviewr`
-    /// binary; main suspends the TUI, runs it, and resumes the same view.
-    Review,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
