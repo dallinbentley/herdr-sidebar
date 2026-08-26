@@ -601,33 +601,6 @@ pub fn focused_tab(pane_list_json: &str) -> String {
 }
 
 /// The tab containing `pane_id` ("" when absent) — the hide path snoozes it.
-/// FORK(review view): absolute path to the `herdr-reviewr` binary — the
-/// installed `persiyanov.reviewr` plugin's `bin/herdr-reviewr`, else the
-/// first match on `PATH`. `None` means it isn't installed.
-pub fn resolve_reviewr() -> Option<std::path::PathBuf> {
-    if let Ok(json) = crate::ipc::call_text("plugin.list", serde_json::json!({}))
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(strip_bom(&json))
-        && let Some(plugins) = value
-            .get("result")
-            .and_then(|r| r.get("plugins"))
-            .and_then(|p| p.as_array())
-        && let Some(root) = plugins
-            .iter()
-            .find(|p| p.get("plugin_id").and_then(|s| s.as_str()) == Some("persiyanov.reviewr"))
-            .and_then(|p| p.get("plugin_root"))
-            .and_then(|s| s.as_str())
-    {
-        let bin = std::path::Path::new(root).join("bin").join("herdr-reviewr");
-        if bin.is_file() {
-            return Some(bin);
-        }
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join("herdr-reviewr"))
-        .find(|candidate| candidate.is_file())
-}
-
 pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return String::new();

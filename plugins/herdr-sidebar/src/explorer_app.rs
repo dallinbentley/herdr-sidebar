@@ -278,7 +278,6 @@ struct ActivityZones {
     row: u16,
     explorer: (u16, u16),
     source_control: (u16, u16),
-    review: (u16, u16),
 }
 
 impl Default for ActivityZones {
@@ -288,7 +287,6 @@ impl Default for ActivityZones {
             row: u16::MAX,
             explorer: (0, 0),
             source_control: (0, 0),
-            review: (0, 0),
         }
     }
 }
@@ -733,23 +731,9 @@ impl App {
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
-            KeyCode::Char('3') => return self.open_review(),
             _ => {}
         }
         None
-    }
-
-    /// FORK(review view): hand the pane to herdr-reviewr (main.rs runs it),
-    /// or explain how to install it.
-    fn open_review(&mut self) -> Option<Exit> {
-        if herdr_sidebar::launch::resolve_reviewr().is_some() {
-            Some(Exit::Review)
-        } else {
-            self.notice = Some(
-                "reviewr not found — herdr plugin install persiyanov/herdr-reviewr".into(),
-            );
-            None
-        }
     }
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
@@ -776,9 +760,6 @@ impl App {
                     }
                     if (zones.source_control.0..zones.source_control.1).contains(&mouse.column) {
                         return self.switch_to(View::SourceControl);
-                    }
-                    if (zones.review.0..zones.review.1).contains(&mouse.column) {
-                        return self.open_review();
                     }
                 }
                 let g = self.gear;
@@ -2080,7 +2061,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, git_icon, rev_icon) = activity_icons(self.theme);
+        let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
                 selection_style(true)
@@ -2101,8 +2082,6 @@ impl App {
             Span::styled(format!(" {exp_icon}{slack} "), active(true)),
             Span::raw(" "),
             Span::styled(format!(" {git_icon}{slack} "), active(false)),
-            Span::raw(" "),
-            Span::styled(format!(" {rev_icon}{slack} "), active(false)),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -2116,7 +2095,6 @@ impl App {
             row: area.y,
             explorer: bounds[1],
             source_control: bounds[3],
-            review: bounds[5],
         };
         // Symmetric half-block caps: a 2-cell button with the icon in its
         // vertical center.
