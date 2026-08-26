@@ -892,28 +892,15 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
                 METADATA_SOURCE: crate::state::unix_now().to_string(),
                 TOKEN_PATH: doc_token,
                 TOKEN_CONTROL: control_token,
-                TOKEN_DEDICATED: "1",
             },
         }),
     );
+    // FORK(in-tab preview): the viewer lives as a split in the caller's tab,
+    // so it never stamps TOKEN_DEDICATED or renames the tab it sits in.
     let _ = ipc::call_text(
         "pane.rename",
         serde_json::json!({ "pane_id": pane_id, "label": mode_pane_label(mode) }),
     );
-    let Some(doc_key) = doc_key else { return };
-    if let Ok(list) = ipc::call_text("pane.list", serde_json::json!({}))
-        && let Some(preview) = previews_in(&list)
-            .into_iter()
-            .find(|p| p.pane_id == pane_id)
-    {
-        let _ = ipc::call_text(
-            "tab.rename",
-            serde_json::json!({
-                "tab_id": preview.tab_id,
-                "label": tab_label(doc_key, preview.pinned),
-            }),
-        );
-    }
 }
 
 fn preview_pane_label(doc_name: &str) -> String {
@@ -968,17 +955,14 @@ fn close_preview_tab(preview: &PreviewPane) {
     );
 }
 
-fn pin_own_tab(doc_key: &str) {
+fn pin_own_tab(_doc_key: &str) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
-    let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) else {
-        return;
-    };
-    let tab_id = crate::launch::tab_of(&list, &pane_id);
-    if pane_id.is_empty() || tab_id.is_empty() {
+    if pane_id.is_empty() {
         return;
     }
+    // FORK(in-tab preview): pin only the pane token; the tab is the user's.
     let _ = ipc::call_text(
         "pane.report_metadata",
         serde_json::json!({
@@ -986,10 +970,6 @@ fn pin_own_tab(doc_key: &str) {
             "source": METADATA_SOURCE,
             "tokens": { TOKEN_PINNED: "1" },
         }),
-    );
-    let _ = ipc::call_text(
-        "tab.rename",
-        serde_json::json!({ "tab_id": tab_id, "label": tab_label(doc_key, true) }),
     );
 }
 
@@ -1636,8 +1616,36 @@ pub fn open_in_pane(
         });
     }
 
-    // 3. Nothing reusable — a tab of its own.
-    spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
+    // 3. Nothing reusable — FORK(in-tab preview): a split in the caller's
+    // tab, between the main pane and the sidebar, instead of a tab of its own.
+    spawn_preview_split(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
+}
+
+/// FORK(in-tab preview): spawn the viewer as a split in the sidebar's own tab
+/// and leave it there. `spawn_viewer_pane` already positions it beside the
+/// sidebar; upstream then moves it out to a dedicated tab, which this fork
+/// deliberately skips.
+fn spawn_preview_split(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+    origin_tab_id: &str,
+) -> Result<PreviewTarget, String> {
+    let (new_pane, control) = spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload)?;
+    let tab_id = ipc::call_text("pane.list", serde_json::json!({}))
+        .map(|list| crate::launch::tab_of(&list, &new_pane))
+        .unwrap_or_default();
+    remember_origin(&new_pane, origin_tab_id);
+    if !start_viewer_pane(&new_pane) {
+        cleanup_spawn(&new_pane, &control);
+        return Err("preview process failed to start".into());
+    }
+    Ok(PreviewTarget {
+        pane_id: new_pane,
+        tab_id,
+        origin_tab_id: origin_tab_id.to_string(),
+    })
 }
 
 /// Where a preview request landed. Handed back so a double click can pin
@@ -1676,10 +1684,7 @@ pub fn pin_target(target: &PreviewTarget, doc_key: &str) -> bool {
             "tokens": { TOKEN_PINNED: "1" },
         }),
     );
-    let _ = ipc::call_text(
-        "tab.rename",
-        serde_json::json!({ "tab_id": target.tab_id, "label": tab_label(doc_key, true) }),
-    );
+    // FORK(in-tab preview): no tab.rename — the preview shares the user's tab.
     true
 }
 
@@ -1690,10 +1695,9 @@ fn target_is_showing(previews: &[PreviewPane], target: &PreviewTarget, doc_key: 
     })
 }
 
-/// Spawn a preview and give it its own tab. The pane is split beside the
-/// sidebar first and then MOVED out: `tab.create` would leave a stray shell
-/// pane, and the move reuses the proven `pane.move` path. The `tab.created`
-/// hook docks a sidebar alongside it, so the tree stays reachable.
+/// Upstream path, unused in this fork: spawn a preview and give it its own
+/// tab. Kept verbatim to ease rebasing onto upstream.
+#[allow(dead_code)]
 fn spawn_preview_tab(
     my_pane_id: &str,
     spawn_cwd: &Path,
@@ -2044,14 +2048,19 @@ fn spawn_viewer_pane(
     let control_token = control_token(&control);
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
+    // FORK(in-tab preview): the viewer stays in this tab, so it must land on
+    // the sidebar's INNER side. Docked right: split the left neighbor (the
+    // main pane) so the viewer opens between it and the sidebar. Docked left:
+    // split the right neighbor and swap, as upstream does.
+    let dock_right = crate::state::load_state().dock_right;
     let neighbor = layout
         .as_deref()
-        .and_then(|json| right_neighbor(json, my_pane_id));
+        .and_then(|json| side_neighbor(json, my_pane_id, dock_right));
     // Splitting ourselves (no neighbor): a third of the tab, matching the
     // sidebar's usual share.
     let own_frac = 0.3;
     let (target, ratio, needs_swap) = match &neighbor {
-        Some(id) => (id.clone(), 0.5, true),
+        Some(id) => (id.clone(), 0.5, !dock_right),
         None => (my_pane_id.to_string(), own_frac, false),
     };
     let response = ipc::call_text(
@@ -2170,9 +2179,9 @@ fn preview_spawn_env(control: &Path) -> serde_json::Value {
     env
 }
 
-/// The pane directly to the right of `pane_id` (sharing vertical overlap),
-/// from a `pane.layout` response.
-fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
+/// The pane directly beside `pane_id` (sharing vertical overlap), from a
+/// `pane.layout` response. `left` picks the side to look at.
+fn side_neighbor(layout_json: &str, pane_id: &str, left: bool) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Msg {
         result: Res,
@@ -2205,12 +2214,19 @@ fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
         .find(|p| p.pane_id.as_deref() == Some(pane_id))?
         .rect
         .as_ref()?;
-    let (my_right, my_top, my_bottom) = (me.x + me.width, me.y, me.y + me.height);
+    let (my_left, my_right, my_top, my_bottom) = (me.x, me.x + me.width, me.y, me.y + me.height);
     panes
         .iter()
         .filter(|p| p.pane_id.as_deref() != Some(pane_id))
         .filter_map(|p| Some((p.pane_id.clone()?, p.rect.as_ref()?)))
-        .find(|(_, r)| r.x == my_right && r.y < my_bottom && r.y + r.height > my_top)
+        .find(|(_, r)| {
+            let beside = if left {
+                r.x + r.width == my_left
+            } else {
+                r.x == my_right
+            };
+            beside && r.y < my_bottom && r.y + r.height > my_top
+        })
         .map(|(id, _)| id)
 }
 
